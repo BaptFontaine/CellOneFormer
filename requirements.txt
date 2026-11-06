@@ -1,0 +1,26 @@
+# Deep Learning & Foundation Models
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.38.0
+accelerate>=0.27.0
+datasets>=2.17.0
+evaluate>=0.4.1
+
+# Scientific, Computer Vision & Microscopy
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+scikit-image>=0.22.0
+opencv-python-headless>=4.9.0
+tifffile>=2024.1.30
+imagecodecs>=2024.1.1
+albumentations>=1.4.0
+pillow>=10.2.0
+
+# Experiment Tracking & Configs
+pyyaml>=6.0.1
+tqdm>=4.66.0
+matplotlib>=3.8.0
+wandb>=0.16.0
+
+# Utilities
+pytest>=8.0.0

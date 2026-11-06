@@ -1,0 +1,49 @@
+# Configuration for Multi-Modality Cell Segmentation with OneFormer
+
+project:
+  name: "cell-segmentation-oneformer"
+  experiment_name: "oneformer-swin-multimodal"
+  seed: 42
+
+data:
+  raw_dir: "data/raw"
+  dataset_name: "DatasetCellSeg"   # Folders expected: training/, tuning/, testing/
+  processed_dir: "data/processed"
+  tile_size: 512                   # Size of square patches (H, W)
+  tile_overlap: 64                 # Overlap in pixels between adjacent tiles
+  min_cell_area: 15                # Filter out spurious cell masks < N pixels
+  modalities:                      # Multi-modality microscope types from the challenge
+    - "brightfield"
+    - "fluorescence"
+    - "phase_contrast"
+    - "dic"
+
+model:
+  pretrained_model_name: "shi-labs/oneformer_ade20k_swin_tiny" # swin_tiny for fast convergence; swin_large for SOTA
+  num_queries: 150                 # Fixed transformer object queries per tile
+  num_classes: 2                   # 0: background, 1: cell
+  task: "instance"                 # OneFormer task prompt: "the task is instance"
+
+training:
+  output_dir: "checkpoints"
+  logs_dir: "logs"
+  epochs: 40
+  batch_size: 4                    # Adjust based on remote GPU VRAM
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  backbone_learning_rate: 1.0e-5
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: "cosine"
+  mixed_precision: "fp16"          # Options: "no", "fp16", "bf16"
+  eval_every_epochs: 2
+  save_total_limit: 3
+  early_stopping_patience: 10
+  use_wandb: false
+
+inference:
+  batch_size: 4
+  tile_size: 512
+  tile_overlap: 64
+  iou_threshold_stitch: 0.5        # Soft-IoU threshold to deduplicate cells across seams
+  score_threshold: 0.5             # Minimum confidence threshold for instance prediction

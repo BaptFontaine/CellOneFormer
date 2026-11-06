@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  cell-segmentation:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: cell-segmentation-oneformer:latest
+    container_name: cell_oneformer_training
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ../data:/workspace/data
+      - ../checkpoints:/workspace/checkpoints
+      - ../logs:/workspace/logs
+      - ../configs:/workspace/configs
+      - ../src:/workspace/src
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - CUDA_VISIBLE_DEVICES=all
+    command: python src/training/train.py --config configs/config.yaml
