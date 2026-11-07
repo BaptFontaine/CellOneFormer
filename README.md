@@ -92,7 +92,7 @@ cd docker
 docker compose up --build
 ```
 
-### Option 2: Google Colab / Kaggle (Free T4 / A100 GPU)
+### Option 2: Google Colab / Kaggle
 1. Open [`notebooks/remote_training_colab.ipynb`](notebooks/remote_training_colab.ipynb) in Google Colab.
 2. Select **Runtime > Change runtime type > GPU**.
 3. Follow the 5 simple cells to clone your repo, tile data, and train.
