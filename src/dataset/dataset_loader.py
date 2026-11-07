@@ -140,12 +140,18 @@ class CellOneFormerDataset(Dataset):
                     ip.ignore_index = 0
                 # Ensure class 1 (cell) is explicitly recognized as a countable "thing"
                 ip.thing_ids = [1]
+                if hasattr(ip, "class_names") and isinstance(ip.class_names, list):
+                    if "cell" not in ip.class_names:
+                        ip.class_names.append("cell")
                 if hasattr(ip, "metadata") and isinstance(ip.metadata, dict):
                     ip.metadata["thing_ids"] = [1]
-                    ip.metadata["1"] = {"name": "cell", "isthing": 1}
-                    ip.metadata[1] = {"name": "cell", "isthing": 1}
-                    ip.metadata["0"] = {"name": "background", "isthing": 0}
-                    ip.metadata[0] = {"name": "background", "isthing": 0}
+                    ip.metadata["1"] = "cell"
+                    ip.metadata[1] = "cell"
+                    ip.metadata["0"] = "background"
+                    ip.metadata[0] = "background"
+                    if "class_names" in ip.metadata and isinstance(ip.metadata["class_names"], list):
+                        if "cell" not in ip.metadata["class_names"]:
+                            ip.metadata["class_names"].append("cell")
 
             if mask is not None:
                 # If tile has no cells during training, resample another tile
