@@ -107,9 +107,14 @@ def compute_challenge_benchmark_metrics(
 
     return {
         "AP_50": metrics_at_50["precision"],
+        "AP@50": metrics_at_50["precision"],
         "AP_75": metrics_at_75["precision"],
+        "AP@75": metrics_at_75["precision"],
         "F1_50": metrics_at_50["f1"],
+        "F1": metrics_at_50["f1"],
+        "mean_f1": float(np.mean(f1_scores)),
         "mAP_50_95": float(np.mean(f1_scores)),
+        "mAP@[50:95]": float(np.mean(f1_scores)),
         "TP_50": metrics_at_50["tp"],
         "FP_50": metrics_at_50["fp"],
         "FN_50": metrics_at_50["fn"],
