@@ -269,6 +269,7 @@ def main():
         pretrained_model_name=cfg["model"]["pretrained_model_name"],
         num_classes=cfg["model"]["num_classes"],
         num_queries=cfg["model"]["num_queries"],
+        is_training=True,
     )
     model_module.to(device)
 

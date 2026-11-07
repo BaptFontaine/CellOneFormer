@@ -24,12 +24,14 @@ class CellOneFormerModule(nn.Module):
         num_classes: int = 2,
         num_queries: int = 150,
         freeze_backbone: bool = False,
+        is_training: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.num_queries = num_queries
+        self.is_training = is_training
 
-        print(f"[Model] Loading OneFormer config and weights from '{pretrained_model_name}'...")
+        print(f"[Model] Loading OneFormer config and weights from '{pretrained_model_name}' (is_training={is_training})...")
         
         # Load processor
         self.processor = OneFormerProcessor.from_pretrained(pretrained_model_name)
@@ -57,11 +59,11 @@ class CellOneFormerModule(nn.Module):
         # Load configuration and customize for cell segmentation (2 classes: background, cell)
         config = OneFormerConfig.from_pretrained(
             pretrained_model_name,
-            is_training=True,
+            is_training=is_training,
         )
         config.num_queries = num_queries
         config.num_labels = num_classes
-        config.is_training = True
+        config.is_training = is_training
         
         # Label dictionary
         config.id2label = {0: "background", 1: "cell"}

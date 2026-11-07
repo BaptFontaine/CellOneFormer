@@ -80,7 +80,7 @@ def main():
 
     if args.weights and os.path.exists(args.weights):
         print(f"[Inference] Loading trained weights from {args.weights}...")
-        model_module.load_state_dict(torch.load(args.weights, map_location=device))
+        model_module.load_state_dict(torch.load(args.weights, map_location=device), strict=False)
     else:
         print("[Inference] No weights provided; running zero-shot with base weights.")
 
