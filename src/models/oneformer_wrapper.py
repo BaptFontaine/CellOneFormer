@@ -58,6 +58,8 @@ class CellOneFormerModule(nn.Module):
         config = OneFormerConfig.from_pretrained(pretrained_model_name)
         config.num_queries = num_queries
         config.num_labels = num_classes
+        # Disable pretraining contrastive text loss (focus on mask, dice and CE losses for instance segmentation)
+        config.contrastive_temperature = None
         
         # Label dictionary
         config.id2label = {0: "background", 1: "cell"}
