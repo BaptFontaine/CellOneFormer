@@ -34,8 +34,19 @@ class CellOneFormerModule(nn.Module):
         # Load processor
         self.processor = OneFormerProcessor.from_pretrained(pretrained_model_name)
         if hasattr(self.processor, "image_processor"):
-            self.processor.image_processor.ignore_index = 0
-            self.processor.image_processor.do_reduce_labels = False
+            ip = self.processor.image_processor
+            ip.ignore_index = 0
+            ip.do_reduce_labels = False
+            # Hugging Face OneFormer requires num_text to be an integer (queries count)
+            ip.num_text = num_queries
+            # Explicitly register class 1 (cell) as a countable "thing" instance
+            ip.thing_ids = [1]
+            if hasattr(ip, "metadata") and isinstance(ip.metadata, dict):
+                ip.metadata["thing_ids"] = [1]
+                ip.metadata["1"] = {"name": "cell", "isthing": 1}
+                ip.metadata[1] = {"name": "cell", "isthing": 1}
+                ip.metadata["0"] = {"name": "background", "isthing": 0}
+                ip.metadata[0] = {"name": "background", "isthing": 0}
 
         # Load configuration and customize for cell segmentation (2 classes: background, cell)
         config = OneFormerConfig.from_pretrained(pretrained_model_name)

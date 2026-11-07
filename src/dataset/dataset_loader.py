@@ -55,10 +55,28 @@ class CellOneFormerDataset(Dataset):
 
         # Collect image files
         extensions = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff")
-        self.image_paths = []
+        all_image_paths = []
         for ext in extensions:
-            self.image_paths.extend(glob.glob(os.path.join(images_dir, ext)))
-        self.image_paths.sort()
+            all_image_paths.extend(glob.glob(os.path.join(images_dir, ext)))
+        all_image_paths.sort()
+
+        # Filter out empty background tiles during training (OneFormer requires at least 1 instance)
+        if self.masks_dir is not None and self.is_train:
+            valid_paths = []
+            for img_p in all_image_paths:
+                b_name = os.path.splitext(os.path.basename(img_p))[0]
+                has_cells = True
+                for p_name in [f"{b_name}_mask.png", f"{b_name}.png", f"{b_name}_mask.tif", f"{b_name}.tif"]:
+                    mp = os.path.join(self.masks_dir, p_name)
+                    if os.path.exists(mp):
+                        m = load_instance_mask(mp)
+                        has_cells = (m.max() > 0)
+                        break
+                if has_cells:
+                    valid_paths.append(img_p)
+            self.image_paths = valid_paths if len(valid_paths) > 0 else all_image_paths
+        else:
+            self.image_paths = all_image_paths
 
         if max_samples is not None and max_samples > 0:
             self.image_paths = self.image_paths[:max_samples]
@@ -114,7 +132,26 @@ class CellOneFormerDataset(Dataset):
 
         # If processor is available, preprocess for OneFormer
         if self.processor is not None:
+            if hasattr(self.processor, "image_processor"):
+                ip = self.processor.image_processor
+                if getattr(ip, "num_text", None) is None:
+                    ip.num_text = 150
+                if getattr(ip, "ignore_index", None) is None:
+                    ip.ignore_index = 0
+                # Ensure class 1 (cell) is explicitly recognized as a countable "thing"
+                ip.thing_ids = [1]
+                if hasattr(ip, "metadata") and isinstance(ip.metadata, dict):
+                    ip.metadata["thing_ids"] = [1]
+                    ip.metadata["1"] = {"name": "cell", "isthing": 1}
+                    ip.metadata[1] = {"name": "cell", "isthing": 1}
+                    ip.metadata["0"] = {"name": "background", "isthing": 0}
+                    ip.metadata[0] = {"name": "background", "isthing": 0}
+
             if mask is not None:
+                # If tile has no cells during training, resample another tile
+                if mask.max() == 0 and self.is_train and len(self.image_paths) > 1:
+                    return self.__getitem__(np.random.randint(0, len(self.image_paths)))
+
                 # Build instance_id_to_semantic_id dictionary:
                 # 0 is background (class 0), and all non-zero instance IDs are cells (class 1)
                 unique_ids = np.unique(mask)
