@@ -74,6 +74,14 @@ class CellOneFormerModule(nn.Module):
             ignore_mismatched_sizes=True,
         )
 
+        # Bypass auxiliary text-contrastive loss (not used for 2-class instance segmentation)
+        try:
+            object.__setattr__(self.model.config, "contrastive_temperature", None)
+        except Exception:
+            pass
+        if hasattr(self.model, "criterion"):
+            self.model.criterion.loss_contrastive = lambda *args, **kwargs: {}
+
         if freeze_backbone:
             print("[Model] Freezing backbone layers for transfer learning...")
             for param in self.model.model.pixel_level_module.encoder.parameters():
