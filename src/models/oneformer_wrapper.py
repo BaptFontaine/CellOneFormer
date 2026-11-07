@@ -55,11 +55,13 @@ class CellOneFormerModule(nn.Module):
                         ip.metadata["class_names"].append("cell")
 
         # Load configuration and customize for cell segmentation (2 classes: background, cell)
-        config = OneFormerConfig.from_pretrained(pretrained_model_name)
+        config = OneFormerConfig.from_pretrained(
+            pretrained_model_name,
+            is_training=True,
+        )
         config.num_queries = num_queries
         config.num_labels = num_classes
-        # Disable pretraining contrastive text loss (focus on mask, dice and CE losses for instance segmentation)
-        config.contrastive_temperature = None
+        config.is_training = True
         
         # Label dictionary
         config.id2label = {0: "background", 1: "cell"}
