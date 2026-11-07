@@ -95,6 +95,7 @@ class CellOneFormerModule(nn.Module):
         task_inputs: Optional[torch.Tensor] = None,
         mask_labels: Optional[List[torch.Tensor]] = None,
         class_labels: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Forward pass during training or inference.
@@ -107,6 +108,7 @@ class CellOneFormerModule(nn.Module):
             task_inputs=task_inputs,
             mask_labels=mask_labels,
             class_labels=class_labels,
+            **kwargs,
         )
         return outputs
 

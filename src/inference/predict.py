@@ -107,17 +107,12 @@ def main():
                 task_inputs=[task_key],
                 return_tensors="pt",
             )
-            pixel_values = inputs["pixel_values"].to(device)
-            text_inputs = inputs["text_inputs"].to(device)
-            task_inputs = inputs.get("task_inputs")
-            if task_inputs is not None:
-                task_inputs = task_inputs.to(device)
+            device_inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
 
-            outputs = model_module(
-                pixel_values=pixel_values,
-                text_inputs=text_inputs,
-                task_inputs=task_inputs,
-            )
+            outputs = model_module(**device_inputs)
 
             # Post-process into binary masks
             post_processed = model_module.post_process_instances(
