@@ -33,6 +33,9 @@ class CellOneFormerModule(nn.Module):
         
         # Load processor
         self.processor = OneFormerProcessor.from_pretrained(pretrained_model_name)
+        if hasattr(self.processor, "image_processor"):
+            self.processor.image_processor.ignore_index = 0
+            self.processor.image_processor.do_reduce_labels = False
 
         # Load configuration and customize for cell segmentation (2 classes: background, cell)
         config = OneFormerConfig.from_pretrained(pretrained_model_name)

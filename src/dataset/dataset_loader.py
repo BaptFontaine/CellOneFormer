@@ -115,13 +115,11 @@ class CellOneFormerDataset(Dataset):
         # If processor is available, preprocess for OneFormer
         if self.processor is not None:
             if mask is not None:
-                # Build instance_id_to_semantic_id dictionary: all cell instances map to class 1
+                # Build instance_id_to_semantic_id dictionary:
+                # 0 is background (class 0), and all non-zero instance IDs are cells (class 1)
                 unique_ids = np.unique(mask)
-                instance_id_to_semantic_id = {}
-                for uid in unique_ids:
-                    if uid == 0:
-                        continue
-                    instance_id_to_semantic_id[int(uid)] = 1  # 1 = cell class
+                instance_id_to_semantic_id = {int(uid): 1 for uid in unique_ids}
+                instance_id_to_semantic_id[0] = 0
 
                 inputs = self.processor(
                     images=pil_image,
