@@ -118,10 +118,11 @@ def main():
             outputs = model_module(**device_inputs)
 
             score_thresh = args.score_threshold if args.score_threshold is not None else cfg["inference"]["score_threshold"]
+            target_sizes = [(img_crop.shape[0], img_crop.shape[1])]
             # Post-process into binary masks
             post_processed = model_module.post_process_instances(
                 outputs,
-                target_sizes=[(cfg["inference"]["tile_size"], cfg["inference"]["tile_size"])],
+                target_sizes=target_sizes,
                 threshold=score_thresh,
             )
 

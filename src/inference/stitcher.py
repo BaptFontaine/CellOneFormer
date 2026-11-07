@@ -52,8 +52,12 @@ class TileStitcher:
                 if np.sum(mask) < self.min_area:
                     continue
 
+                target_h = y2 - y1
+                target_w = x2 - x1
+                crop_mask = mask[:target_h, :target_w]
+
                 canvas = np.zeros((full_height, full_width), dtype=bool)
-                canvas[y1:y2, x1:x2] = mask.astype(bool)
+                canvas[y1:y2, x1:x2] = crop_mask.astype(bool)
                 all_global_masks.append(canvas)
                 all_scores.append(score)
 
