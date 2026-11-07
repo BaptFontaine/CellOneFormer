@@ -7,6 +7,10 @@ Supports official challenge structure: DatasetCellSeg/{training, tuning, testing
 
 import os
 import sys
+
+# Configure PyTorch CUDA memory allocator to reduce fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import yaml
 import glob
@@ -296,17 +300,17 @@ def main():
     output_dir = Path(cfg["training"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[Training] Starting remote training for {epochs} epochs on {device}...")
+    grad_accum_steps = max(1, int(cfg["training"].get("gradient_accumulation_steps", 1)))
+    print(f"\n[Training] Starting remote training for {epochs} epochs on {device} (batch_size={batch_size}, grad_accum={grad_accum_steps})...")
     best_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
         model_module.train()
         epoch_loss = 0.0
+        optimizer.zero_grad()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
-        for batch in pbar:
-            optimizer.zero_grad()
-
+        for step, batch in enumerate(pbar):
             pixel_values = batch["pixel_values"].to(device)
             text_inputs = batch["text_inputs"].to(device)
             task_inputs = batch.get("task_inputs")
@@ -325,16 +329,22 @@ def main():
                     class_labels=class_labels,
                 )
                 loss = outputs.loss
+                loss_scaled = loss / grad_accum_steps
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss_scaled).backward()
+
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
             epoch_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = epoch_loss / max(1, len(train_loader))
         scheduler.step()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print(f"[Epoch {epoch}/{epochs}] Average Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Save checkpoint

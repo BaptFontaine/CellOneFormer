@@ -28,8 +28,8 @@ training:
   output_dir: "checkpoints"
   logs_dir: "logs"
   epochs: 40
-  batch_size: 4                    # Adjust based on remote GPU VRAM
-  gradient_accumulation_steps: 4
+  batch_size: 2                    # Set to 2 to prevent CUDA OOM on Colab 15GB T4/V100
+  gradient_accumulation_steps: 8   # Effective batch size = 2 * 8 = 16
   learning_rate: 1.0e-4
   backbone_learning_rate: 1.0e-5
   weight_decay: 0.05
