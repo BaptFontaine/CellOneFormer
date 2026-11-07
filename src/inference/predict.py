@@ -34,6 +34,9 @@ def parse_args():
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config YAML")
     parser.add_argument("--output-dir", type=str, default="predictions", help="Directory to save output masks and visualisations")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda/cpu)")
+    parser.add_argument("--score-threshold", type=float, default=None, help="Detection confidence threshold")
+    parser.add_argument("--stitch-iou", type=float, default=None, help="Soft-IoU seam deduplication threshold")
+    parser.add_argument("--min-area", type=int, default=None, help="Minimum cell area in pixels")
     return parser.parse_args()
 
 
@@ -114,11 +117,12 @@ def main():
 
             outputs = model_module(**device_inputs)
 
+            score_thresh = args.score_threshold if args.score_threshold is not None else cfg["inference"]["score_threshold"]
             # Post-process into binary masks
             post_processed = model_module.post_process_instances(
                 outputs,
                 target_sizes=[(cfg["inference"]["tile_size"], cfg["inference"]["tile_size"])],
-                threshold=cfg["inference"]["score_threshold"],
+                threshold=score_thresh,
             )
 
             tile_masks = []
@@ -139,9 +143,11 @@ def main():
             })
 
     # Stitch predictions
+    stitch_iou = args.stitch_iou if args.stitch_iou is not None else cfg["inference"]["iou_threshold_stitch"]
+    min_area = args.min_area if args.min_area is not None else cfg["data"]["min_cell_area"]
     stitcher = TileStitcher(
-        iou_threshold=cfg["inference"]["iou_threshold_stitch"],
-        min_area=cfg["data"]["min_cell_area"],
+        iou_threshold=stitch_iou,
+        min_area=min_area,
     )
     label_matrix, kept_masks = stitcher.stitch_tile_predictions(orig_h, orig_w, tile_results)
 
