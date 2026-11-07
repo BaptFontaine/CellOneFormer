@@ -171,8 +171,15 @@ class CellOneFormerDataset(Dataset):
                     instance_id_to_semantic_id=instance_id_to_semantic_id,
                     return_tensors="pt",
                 )
-                # Squeeze leading batch dimension added by processor
-                item = {k: v.squeeze(0) for k, v in inputs.items()}
+                # Unpack leading batch dimension added by processor
+                item = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        item[k] = v.squeeze(0)
+                    elif isinstance(v, list) and len(v) > 0:
+                        item[k] = v[0]
+                    else:
+                        item[k] = v
                 item["image_path"] = img_path
                 return item
             else:
@@ -181,7 +188,14 @@ class CellOneFormerDataset(Dataset):
                     task_inputs=[task_key],
                     return_tensors="pt",
                 )
-                item = {k: v.squeeze(0) for k, v in inputs.items()}
+                item = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        item[k] = v.squeeze(0)
+                    elif isinstance(v, list) and len(v) > 0:
+                        item[k] = v[0]
+                    else:
+                        item[k] = v
                 item["image_path"] = img_path
                 return item
 
