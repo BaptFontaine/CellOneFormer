@@ -5,12 +5,19 @@ and stitches them back into global instance maps with Soft-IoU suppression.
 """
 
 import os
+import sys
 import argparse
 import yaml
 import numpy as np
+from pathlib import Path
+
+# Add project root to sys.path so 'from src...' always resolves cleanly
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import cv2
 import torch
-from pathlib import Path
 from PIL import Image
 
 from src.dataset.tiler import SlidingWindowTiler, load_microscopy_image, load_instance_mask
@@ -86,7 +93,8 @@ def main():
     print(f"[Inference] Sliced {orig_h}x{orig_w} image into {len(tiles)} overlapping tiles.")
 
     tile_results = []
-    task_prompt = f"the task is {cfg['model']['task']}"
+    task_name = cfg["model"].get("task", "instance").lower()
+    task_key = "instance" if "instance" in task_name else ("semantic" if "semantic" in task_name else "panoptic")
 
     # Predict on each tile
     with torch.no_grad():
@@ -96,7 +104,7 @@ def main():
 
             inputs = model_module.processor(
                 images=pil_img,
-                task_inputs=[task_prompt],
+                task_inputs=[task_key],
                 return_tensors="pt",
             )
             pixel_values = inputs["pixel_values"].to(device)

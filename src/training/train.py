@@ -6,11 +6,18 @@ Supports official challenge structure: DatasetCellSeg/{training, tuning, testing
 """
 
 import os
+import sys
 import argparse
 import yaml
 import glob
 from pathlib import Path
 from typing import List, Tuple, Optional
+
+# Add project root to sys.path so 'from src...' always resolves cleanly
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import cv2
 import torch
 from torch.utils.data import DataLoader
@@ -281,7 +288,10 @@ def main():
     optimizer = AdamW(model_module.parameters(), lr=lr, weight_decay=cfg["training"]["weight_decay"])
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     use_amp = (cfg["training"]["mixed_precision"] in ("fp16", "bf16")) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (TypeError, AttributeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     output_dir = Path(cfg["training"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)

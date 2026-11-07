@@ -26,8 +26,8 @@ def get_microscopy_augmentations(is_train: bool = True, image_size: int = 512) -
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=45, p=0.5, border_mode=0),
-            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.Affine(scale=(0.9, 1.1), translate_percent=(-0.06, 0.06), rotate=(-45, 45), p=0.5),
+            A.GaussNoise(p=0.3),
         ])
     return A.Compose([])
 
@@ -103,7 +103,14 @@ class CellOneFormerDataset(Dataset):
             image = np.stack([image] * 3, axis=-1)
         pil_image = Image.fromarray(image.astype(np.uint8))
 
-        task_prompt = f"the task is {self.task}"
+        # Hugging Face OneFormerProcessor strictly expects "instance", "semantic", or "panoptic"
+        task_name = self.task.lower().strip()
+        if "instance" in task_name:
+            task_key = "instance"
+        elif "semantic" in task_name:
+            task_key = "semantic"
+        else:
+            task_key = "panoptic"
 
         # If processor is available, preprocess for OneFormer
         if self.processor is not None:
@@ -118,7 +125,7 @@ class CellOneFormerDataset(Dataset):
 
                 inputs = self.processor(
                     images=pil_image,
-                    task_inputs=[task_prompt],
+                    task_inputs=[task_key],
                     segmentation_maps=mask,
                     instance_id_to_semantic_id=instance_id_to_semantic_id,
                     return_tensors="pt",
@@ -130,7 +137,7 @@ class CellOneFormerDataset(Dataset):
             else:
                 inputs = self.processor(
                     images=pil_image,
-                    task_inputs=[task_prompt],
+                    task_inputs=[task_key],
                     return_tensors="pt",
                 )
                 item = {k: v.squeeze(0) for k, v in inputs.items()}
@@ -140,7 +147,7 @@ class CellOneFormerDataset(Dataset):
         return {
             "image": torch.tensor(image).permute(2, 0, 1).float() / 255.0,
             "mask": torch.tensor(mask).long() if mask is not None else None,
-            "task": task_prompt,
+            "task": task_key,
             "image_path": img_path,
         }
 
