@@ -309,13 +309,18 @@ def main():
 
             pixel_values = batch["pixel_values"].to(device)
             text_inputs = batch["text_inputs"].to(device)
+            task_inputs = batch.get("task_inputs")
+            if task_inputs is not None:
+                task_inputs = task_inputs.to(device)
             mask_labels = [m.to(device) for m in batch["mask_labels"]]
             class_labels = [c.to(device) for c in batch["class_labels"]]
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            autocast_ctx = torch.amp.autocast("cuda", enabled=use_amp) if hasattr(torch.amp, "autocast") else torch.cuda.amp.autocast(enabled=use_amp)
+            with autocast_ctx:
                 outputs = model_module(
                     pixel_values=pixel_values,
                     text_inputs=text_inputs,
+                    task_inputs=task_inputs,
                     mask_labels=mask_labels,
                     class_labels=class_labels,
                 )

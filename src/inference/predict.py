@@ -109,10 +109,14 @@ def main():
             )
             pixel_values = inputs["pixel_values"].to(device)
             text_inputs = inputs["text_inputs"].to(device)
+            task_inputs = inputs.get("task_inputs")
+            if task_inputs is not None:
+                task_inputs = task_inputs.to(device)
 
             outputs = model_module(
                 pixel_values=pixel_values,
                 text_inputs=text_inputs,
+                task_inputs=task_inputs,
             )
 
             # Post-process into binary masks
