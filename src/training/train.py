@@ -379,6 +379,13 @@ def main():
             save_path = output_dir / "oneformer_cells_best.pt"
             torch.save(model_module.state_dict(), save_path)
             print(f"[*] Best checkpoint saved to {save_path} (loss: {best_loss:.4f})")
+            
+            # Automatic persistent backup to Google Drive
+            drive_backup_dir = Path("/content/drive/MyDrive/cell_oneformer_real_checkpoints")
+            if drive_backup_dir.parent.exists():
+                drive_backup_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(model_module.state_dict(), drive_backup_dir / "oneformer_real_cells_best.pt")
+                print(f"[*] Checkpoint automatically backed up to Google Drive: {drive_backup_dir / 'oneformer_real_cells_best.pt'}")
 
     print("[Training] Remote training finished successfully.")
 
