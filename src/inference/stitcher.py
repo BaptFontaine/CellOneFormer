@@ -5,6 +5,7 @@ using soft-IoU suppression across seams.
 """
 
 import numpy as np
+import cv2
 from typing import Dict, List, Tuple
 
 
@@ -28,13 +29,12 @@ class TileStitcher:
             full_height: height of original microscopy image
             full_width: width of original microscopy image
             tile_results: list of dicts, each with:
-                - 'masks': binary masks list or array of shape (K, H_tile, W_tile)
-                - 'scores': list/array of confidence scores for each mask
-                - 'coords': (y1, y2, x1, x2) in original image space
-
+                - 'masks': List of boolean 2D masks
+                - 'scores': List of float confidence scores
+                - 'coords': (y1, y2, x1, x2) in original image coordinates
         Returns:
-            label_matrix: 2D integer array (H, W) where 0 is background, 1..N are unique cells
-            global_masks: 3D boolean array (N, H, W)
+            label_matrix: (full_height, full_width) int32 map where each cell has a unique integer ID >= 1
+            kept_masks: (N_cells, full_height, full_width) boolean array of deduplicated instances
         """
         all_global_masks = []
         all_scores = []
@@ -45,6 +45,9 @@ class TileStitcher:
             masks = res.get("masks", [])
             scores = res.get("scores", [])
 
+            target_h = y2 - y1
+            target_w = x2 - x1
+
             for idx, mask in enumerate(masks):
                 score = float(scores[idx]) if len(scores) > idx else 1.0
                 
@@ -52,12 +55,16 @@ class TileStitcher:
                 if np.sum(mask) < self.min_area:
                     continue
 
-                target_h = y2 - y1
-                target_w = x2 - x1
-                crop_mask = mask[:target_h, :target_w]
+                # Ensure mask is exactly target_h x target_w (handles any resolution difference)
+                if mask.shape != (target_h, target_w):
+                    mask = cv2.resize(
+                        mask.astype(np.uint8),
+                        (target_w, target_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
 
                 canvas = np.zeros((full_height, full_width), dtype=bool)
-                canvas[y1:y2, x1:x2] = crop_mask.astype(bool)
+                canvas[y1:y2, x1:x2] = mask
                 all_global_masks.append(canvas)
                 all_scores.append(score)
 
@@ -71,7 +78,7 @@ class TileStitcher:
         order = np.argsort(-all_scores)
         keep_indices = []
 
-        # 3. Soft-IoU suppression for overlapping duplicate cells
+        # 3. Soft-IoU suppression for overlapping duplicate cells across tile seams
         suppressed = np.zeros(len(order), dtype=bool)
 
         for i in range(len(order)):
@@ -81,7 +88,6 @@ class TileStitcher:
 
             keep_indices.append(idx_i)
             mask_i = all_global_masks[idx_i]
-            area_i = np.sum(mask_i)
 
             for j in range(i + 1, len(order)):
                 idx_j = order[j]
@@ -89,21 +95,23 @@ class TileStitcher:
                     continue
 
                 mask_j = all_global_masks[idx_j]
-                intersection = np.sum(mask_i & mask_j)
 
-                if intersection > 0:
-                    union = area_i + np.sum(mask_j) - intersection
-                    iou = intersection / max(union, 1e-6)
+                # Bounding-box intersection fast-check
+                intersection = np.logical_and(mask_i, mask_j).sum()
+                if intersection == 0:
+                    continue
 
-                    # If IoU exceeds threshold, suppress redundant detection
-                    if iou >= self.iou_threshold:
-                        suppressed[idx_j] = True
+                union = np.logical_or(mask_i, mask_j).sum()
+                iou = intersection / union if union > 0 else 0.0
+
+                if iou >= self.iou_threshold:
+                    suppressed[idx_j] = True
 
         kept_masks = all_global_masks[keep_indices]
 
-        # 4. Create final integer instance map (1..N)
+        # 4. Construct integer label matrix for challenge submission / export
         label_matrix = np.zeros((full_height, full_width), dtype=np.int32)
-        for cell_id, mask in enumerate(kept_masks, start=1):
+        for cell_id, mask in enumerate(kept_masks, 1):
             label_matrix[mask] = cell_id
 
         return label_matrix, kept_masks
