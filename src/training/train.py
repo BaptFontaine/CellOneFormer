@@ -120,6 +120,7 @@ def tile_and_save_split(
     output_split_dir: Path,
     tiler: SlidingWindowTiler,
     is_dry_run: bool = False,
+    max_samples: Optional[int] = None,
 ) -> int:
     """Slices a list of (image, mask) pairs into tiles and writes them to disk."""
     out_img_dir = output_split_dir / "images"
@@ -129,6 +130,8 @@ def tile_and_save_split(
 
     if is_dry_run:
         pairs = pairs[:2]
+    elif max_samples is not None and max_samples > 0:
+        pairs = pairs[:max_samples]
 
     tile_count = 0
     for img_path, mask_path in tqdm(pairs, desc=f"Tiling {output_split_dir.name}"):
@@ -157,10 +160,17 @@ def prepare_tiled_data(cfg, is_dry_run=False):
     if not cellseg_root.exists() and (raw_root / "training").exists():
         cellseg_root = raw_root
 
-    # Identify training and tuning (val) folders
-    train_source = cellseg_root / "training"
-    tuning_source = cellseg_root / "tuning"
-    test_source = cellseg_root / "testing"
+    def find_case_dir(root: Path, name: str) -> Path:
+        for c in [name, name.capitalize(), name.lower(), name.upper()]:
+            p = root / c
+            if p.exists():
+                return p
+        return root / name
+
+    # Identify training and tuning (val) folders (case-insensitive)
+    train_source = find_case_dir(cellseg_root, "training")
+    tuning_source = find_case_dir(cellseg_root, "tuning")
+    test_source = find_case_dir(cellseg_root, "testing")
 
     processed_train_img = Path(cfg["data"]["processed_dir"]) / "train" / "images"
     processed_val_img = Path(cfg["data"]["processed_dir"]) / "val" / "images"
@@ -197,21 +207,25 @@ def prepare_tiled_data(cfg, is_dry_run=False):
     )
 
     # Tile training set
+    max_train = cfg["data"].get("max_train_samples", None)
     n_train_tiles = tile_and_save_split(
         train_pairs,
         Path(cfg["data"]["processed_dir"]) / "train",
         tiler,
         is_dry_run=is_dry_run,
+        max_samples=max_train,
     )
     print(f"[Setup] Generated {n_train_tiles} training tiles.")
 
     # Tile tuning set (if available)
     if len(tuning_pairs) > 0:
+        max_val = cfg["data"].get("max_val_samples", None)
         n_val_tiles = tile_and_save_split(
             tuning_pairs,
             Path(cfg["data"]["processed_dir"]) / "val",
             tiler,
             is_dry_run=is_dry_run,
+            max_samples=max_val,
         )
         print(f"[Setup] Generated {n_val_tiles} validation/tuning tiles.")
 

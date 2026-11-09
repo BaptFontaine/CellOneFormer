@@ -12,6 +12,7 @@ data:
   tile_size: 512                   # Size of square patches (H, W)
   tile_overlap: 64                 # Overlap in pixels between adjacent tiles
   min_cell_area: 15                # Filter out spurious cell masks < N pixels
+  max_cell_area: 8000              # Filter out giant spurious background artifacts > N pixels
   modalities:                      # Multi-modality microscope types from the challenge
     - "brightfield"
     - "fluorescence"

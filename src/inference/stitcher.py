@@ -6,7 +6,7 @@ using soft-IoU suppression across seams.
 
 import numpy as np
 import cv2
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 
 class TileStitcher:
@@ -14,9 +14,10 @@ class TileStitcher:
     Assembles predicted instance masks from sliding-window tiles back into a single full-resolution image.
     """
 
-    def __init__(self, iou_threshold: float = 0.5, min_area: int = 15):
+    def __init__(self, iou_threshold: float = 0.5, min_area: int = 15, max_area: Optional[int] = 8000):
         self.iou_threshold = iou_threshold
         self.min_area = min_area
+        self.max_area = max_area
 
     def stitch_tile_predictions(
         self,
@@ -51,8 +52,9 @@ class TileStitcher:
             for idx, mask in enumerate(masks):
                 score = float(scores[idx]) if len(scores) > idx else 1.0
                 
-                # Check area
-                if np.sum(mask) < self.min_area:
+                # Check area (filter spurious noise < min_area and giant background masks > max_area)
+                mask_area = int(np.sum(mask))
+                if mask_area < self.min_area or (self.max_area is not None and mask_area > self.max_area):
                     continue
 
                 # Ensure mask is exactly target_h x target_w (handles any resolution difference)
