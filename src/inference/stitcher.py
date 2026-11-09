@@ -56,7 +56,7 @@ class TileStitcher:
                     continue
 
                 # Ensure mask is exactly target_h x target_w (handles any resolution difference)
-                if mask.shape != (target_h, target_w):
+                if mask.shape[0] != target_h or mask.shape[1] != target_w:
                     mask = cv2.resize(
                         mask.astype(np.uint8),
                         (target_w, target_h),
@@ -64,7 +64,7 @@ class TileStitcher:
                     ).astype(bool)
 
                 canvas = np.zeros((full_height, full_width), dtype=bool)
-                canvas[y1:y2, x1:x2] = mask
+                canvas[y1:y2, x1:x2] = mask[:target_h, :target_w]
                 all_global_masks.append(canvas)
                 all_scores.append(score)
 
