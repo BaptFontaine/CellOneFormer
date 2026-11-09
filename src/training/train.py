@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     return parser.parse_args()
 
 
@@ -288,6 +289,9 @@ def main():
         num_queries=cfg["model"]["num_queries"],
         is_training=True,
     )
+    if args.resume and os.path.exists(args.resume):
+        print(f"[Training] Resuming from existing checkpoint: {args.resume}")
+        model_module.load_state_dict(torch.load(args.resume, map_location=device), strict=False)
     model_module.to(device)
 
     # Training Dataset & DataLoader

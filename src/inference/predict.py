@@ -128,14 +128,21 @@ def main():
 
             tile_masks = []
             tile_scores = []
-            if len(post_processed) > 0 and "segmentation" in post_processed[0]:
-                inst_map = post_processed[0]["segmentation"].cpu().numpy()
-                u_ids = np.unique(inst_map)
-                for uid in u_ids:
-                    if uid <= 0:
-                        continue
-                    tile_masks.append(inst_map == uid)
-                    tile_scores.append(1.0)
+            if len(post_processed) > 0:
+                first_res = post_processed[0]
+                if "masks" in first_res and len(first_res["masks"]) > 0:
+                    tile_masks = first_res["masks"]
+                    tile_scores = first_res.get("scores", [1.0] * len(tile_masks))
+                elif "segmentation" in first_res:
+                    inst_map = first_res["segmentation"]
+                    if isinstance(inst_map, torch.Tensor):
+                        inst_map = inst_map.cpu().numpy()
+                    u_ids = np.unique(inst_map)
+                    for uid in u_ids:
+                        if uid <= 0:
+                            continue
+                        tile_masks.append(inst_map == uid)
+                        tile_scores.append(1.0)
 
             tile_results.append({
                 "masks": tile_masks,
@@ -160,10 +167,17 @@ def main():
     out_mask_path = output_dir / f"{stem}_pred_mask.png"
     cv2.imwrite(str(out_mask_path), label_matrix)
 
-    # Save visual overlay
+    # Save visual overlay with crisp contours and untouched background
     colored_vis = colorize_instance_mask(label_matrix)
-    alpha = 0.5
-    overlay = cv2.addWeighted(image, 1 - alpha, colored_vis, alpha, 0)
+    overlay = image.copy()
+    if label_matrix.max() > 0:
+        cell_mask = (label_matrix > 0)
+        overlay[cell_mask] = (image[cell_mask].astype(float) * 0.5 + colored_vis[cell_mask].astype(float) * 0.5).astype(np.uint8)
+        for uid in range(1, int(label_matrix.max()) + 1):
+            single_cell = (label_matrix == uid).astype(np.uint8)
+            contours, _ = cv2.findContours(single_cell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
+
     out_vis_path = output_dir / f"{stem}_overlay.png"
     cv2.imwrite(str(out_vis_path), overlay)
 

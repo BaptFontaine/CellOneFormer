@@ -47,4 +47,4 @@ inference:
   tile_size: 512
   tile_overlap: 64
   iou_threshold_stitch: 0.5        # Soft-IoU threshold to deduplicate cells across seams
-  score_threshold: 0.5             # Minimum confidence threshold for instance prediction
+  score_threshold: 0.2             # Minimum confidence threshold for instance prediction (adjusted for fine-tuned queries)

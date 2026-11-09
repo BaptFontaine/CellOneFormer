@@ -136,13 +136,52 @@ class CellOneFormerModule(nn.Module):
         self,
         outputs: Any,
         target_sizes: List[tuple],
-        threshold: float = 0.5,
+        threshold: float = 0.2,
+        mask_threshold: float = 0.5,
+        min_area: int = 15,
     ) -> List[Dict[str, Any]]:
         """
-        Post-processes raw transformer query outputs into binary instance masks.
+        Direct transformer query decoding into binary instance masks.
+        Bypasses ADE20K pre-trained metadata dictionaries for robust custom 2-class cell segmentation.
         """
-        return self.processor.post_process_instance_segmentation(
-            outputs,
-            threshold=threshold,
-            target_sizes=target_sizes,
-        )
+        batch_size = outputs.class_queries_logits.shape[0]
+        results = []
+
+        for b in range(batch_size):
+            target_h, target_w = target_sizes[b]
+            class_logits = outputs.class_queries_logits[b]  # (num_queries, num_classes + 1)
+            mask_logits = outputs.masks_queries_logits[b:b+1]  # (1, num_queries, H_m, W_m)
+
+            probs = torch.softmax(class_logits, dim=-1)
+            # Class 1 corresponds to "cell"
+            cell_scores = probs[:, 1]
+
+            # Upsample predicted mask logits to target crop dimensions
+            upsampled_masks = torch.nn.functional.interpolate(
+                mask_logits,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )[0].sigmoid()  # (num_queries, target_h, target_w)
+
+            masks_list = []
+            scores_list = []
+
+            # Sort candidate queries by descending confidence
+            sorted_indices = torch.argsort(cell_scores, descending=True)
+            for idx in sorted_indices:
+                score = float(cell_scores[idx].item())
+                if score < threshold:
+                    break
+                bin_mask = (upsampled_masks[idx] >= mask_threshold).detach().cpu().numpy()
+                area = int(bin_mask.sum())
+                if area >= min_area:
+                    masks_list.append(bin_mask)
+                    scores_list.append(score)
+
+            results.append({
+                "masks": masks_list,
+                "scores": scores_list,
+            })
+
+        return results
