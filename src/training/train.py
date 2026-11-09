@@ -326,11 +326,18 @@ def main():
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
         for step, batch in enumerate(pbar):
+            if "mask_labels" not in batch or batch["mask_labels"] is None or len(batch["mask_labels"]) == 0:
+                continue
             pixel_values = batch["pixel_values"].to(device)
-            text_inputs = batch["text_inputs"].to(device)
+            text_inputs = batch.get("text_inputs")
+            if text_inputs is not None:
+                text_inputs = text_inputs.to(device)
             task_inputs = batch.get("task_inputs")
             if task_inputs is not None:
                 task_inputs = task_inputs.to(device)
+            pixel_mask = batch.get("pixel_mask")
+            if pixel_mask is not None:
+                pixel_mask = pixel_mask.to(device)
             mask_labels = [m.to(device) for m in batch["mask_labels"]]
             class_labels = [c.to(device) for c in batch["class_labels"]]
 
@@ -338,6 +345,7 @@ def main():
             with autocast_ctx:
                 outputs = model_module(
                     pixel_values=pixel_values,
+                    pixel_mask=pixel_mask,
                     text_inputs=text_inputs,
                     task_inputs=task_inputs,
                     mask_labels=mask_labels,

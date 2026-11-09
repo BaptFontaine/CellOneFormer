@@ -65,7 +65,7 @@ class CellOneFormerDataset(Dataset):
             valid_paths = []
             for img_p in all_image_paths:
                 b_name = os.path.splitext(os.path.basename(img_p))[0]
-                has_cells = True
+                has_cells = False
                 for p_name in [f"{b_name}_mask.png", f"{b_name}.png", f"{b_name}_mask.tif", f"{b_name}.tif"]:
                     mp = os.path.join(self.masks_dir, p_name)
                     if os.path.exists(mp):
@@ -153,11 +153,11 @@ class CellOneFormerDataset(Dataset):
                         if "cell" not in ip.metadata["class_names"]:
                             ip.metadata["class_names"].append("cell")
 
-            if mask is not None:
-                # If tile has no cells during training, resample another tile
-                if mask.max() == 0 and self.is_train and len(self.image_paths) > 1:
-                    return self.__getitem__(np.random.randint(0, len(self.image_paths)))
+            # In training mode, a valid sample must have a non-empty mask with at least 1 cell
+            if (mask is None or mask.max() == 0) and self.is_train and len(self.image_paths) > 1:
+                return self.__getitem__(np.random.randint(0, len(self.image_paths)))
 
+            if mask is not None:
                 # Build instance_id_to_semantic_id dictionary:
                 # 0 is background (class 0), and all non-zero instance IDs are cells (class 1)
                 unique_ids = np.unique(mask)
@@ -211,16 +211,24 @@ def collate_fn_oneformer(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Custom collator for OneFormer batches handling variable-length mask labels.
     """
-    keys = batch[0].keys()
+    # Filter out any corrupt items that lack mask_labels during training
+    valid_batch = [b for b in batch if "mask_labels" in b and "pixel_values" in b]
+    if len(valid_batch) == 0:
+        valid_batch = batch
+
+    keys = valid_batch[0].keys()
     collated = {}
 
     for k in keys:
         if k in ("image_path", "task"):
-            collated[k] = [b[k] for b in batch]
+            collated[k] = [b.get(k) for b in valid_batch]
         elif k in ("mask_labels", "class_labels"):
-            # Variable number of instances per image
-            collated[k] = [b[k] for b in batch]
+            collated[k] = [b[k] for b in valid_batch if k in b]
         else:
-            collated[k] = torch.stack([b[k] for b in batch])
+            tensors = [b[k] for b in valid_batch if k in b and isinstance(b[k], torch.Tensor)]
+            if len(tensors) == len(valid_batch):
+                collated[k] = torch.stack(tensors)
+            else:
+                collated[k] = [b.get(k) for b in valid_batch]
 
     return collated
