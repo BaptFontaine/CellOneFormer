@@ -89,6 +89,16 @@ class CellOneFormerModule(nn.Module):
             for param in self.model.model.pixel_level_module.encoder.parameters():
                 param.requires_grad = False
 
+        # Precompute default tokenized task_inputs for instance segmentation
+        task_seq_len = getattr(self.processor, "task_seq_len", 77)
+        task_tokens = self.processor.tokenizer(
+            ["the task is instance"],
+            padding="max_length",
+            max_length=task_seq_len,
+            return_tensors="pt",
+        )["input_ids"]
+        self.register_buffer("default_task_inputs", task_tokens)
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -103,6 +113,14 @@ class CellOneFormerModule(nn.Module):
         Forward pass during training or inference.
         Returns loss during training if mask_labels and class_labels are provided.
         """
+        # Ensure task_inputs is never None (OneFormer requires a tokenized task prompt)
+        if task_inputs is None:
+            task_inputs = self.default_task_inputs.repeat(pixel_values.shape[0], 1)
+        elif task_inputs.ndim == 1:
+            task_inputs = task_inputs.unsqueeze(0)
+            if task_inputs.shape[0] == 1 and pixel_values.shape[0] > 1:
+                task_inputs = task_inputs.repeat(pixel_values.shape[0], 1)
+
         outputs = self.model(
             pixel_values=pixel_values,
             pixel_mask=pixel_mask,

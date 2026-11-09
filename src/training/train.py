@@ -81,10 +81,13 @@ def find_image_mask_pairs(folder_path: Path) -> List[Tuple[Path, Optional[Path]]
                 for candidate in [
                     lbl_sub / f"{stem}.png",
                     lbl_sub / f"{stem}.tif",
+                    lbl_sub / f"{stem}.tiff",
                     lbl_sub / f"{stem}_label.png",
                     lbl_sub / f"{stem}_mask.png",
                     lbl_sub / f"{stem}_label.tif",
                     lbl_sub / f"{stem}_mask.tif",
+                    lbl_sub / f"{stem}_label.tiff",
+                    lbl_sub / f"{stem}_mask.tiff",
                 ]:
                     if candidate.exists():
                         mask_p = candidate
@@ -144,7 +147,7 @@ def tile_and_save_split(
             cv2.imwrite(str(save_img_path), tile["image"])
             if tile["mask"] is not None:
                 save_msk_path = out_msk_dir / f"{img_path.stem}_tile{t_idx:03d}_mask.png"
-                cv2.imwrite(str(save_msk_path), tile["mask"])
+                cv2.imwrite(str(save_msk_path), tile["mask"].astype(np.uint16))
             tile_count += 1
 
     return tile_count
