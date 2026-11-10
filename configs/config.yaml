@@ -13,6 +13,8 @@ data:
   tile_overlap: 64                 # Overlap in pixels between adjacent tiles
   min_cell_area: 15                # Filter out spurious cell masks < N pixels
   max_cell_area: 8000              # Filter out giant spurious background artifacts > N pixels
+  percentile_norm: true            # Robust 1%-99% percentile normalization for multi-modal microscopy
+  apply_clahe: false               # Optional adaptive histogram equalization
   modalities:                      # Multi-modality microscope types from the challenge
     - "brightfield"
     - "fluorescence"
@@ -21,7 +23,7 @@ data:
 
 model:
   pretrained_model_name: "shi-labs/oneformer_ade20k_swin_tiny" # swin_tiny for fast convergence; swin_large for SOTA
-  num_queries: 150                 # Fixed transformer object queries per tile
+  num_queries: 150                 # Fixed transformer object queries per tile (matches existing checkpoint)
   num_classes: 2                   # 0: background, 1: cell
   task: "instance"                 # OneFormer task prompt: "the task is instance"
 
@@ -48,3 +50,5 @@ inference:
   tile_overlap: 64
   iou_threshold_stitch: 0.5        # Soft-IoU threshold to deduplicate cells across seams
   score_threshold: 0.2             # Minimum confidence threshold for instance prediction (adjusted for fine-tuned queries)
+  gaussian_seam_weighting: true    # Weight central tile predictions higher than border predictions
+  tta: false                       # Enable Test-Time Augmentation (horizontal/vertical flips)

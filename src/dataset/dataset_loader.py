@@ -19,16 +19,26 @@ from src.dataset.tiler import load_microscopy_image, load_instance_mask
 def get_microscopy_augmentations(is_train: bool = True, image_size: int = 512) -> A.Compose:
     """
     Returns data augmentations tailored for multi-modality cell microscopy.
-    Cells are rotationally invariant.
+    Cells are rotationally invariant; photometric transforms improve cross-modality generalization
+    (brightfield, fluorescence, phase-contrast, DIC).
     """
     if is_train:
         return A.Compose([
             A.RandomRotate90(p=0.5),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.Affine(scale=(0.9, 1.1), translate_percent=(-0.06, 0.06), rotate=(-45, 45), p=0.5),
-            A.GaussNoise(p=0.3),
+            A.Affine(
+                scale=(0.85, 1.15),
+                translate_percent=(-0.06, 0.06),
+                rotate=(-45, 45),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=0.5,
+            ),
+            A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.5),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.15, hue=0.05, p=0.3),
+            A.GaussNoise(p=0.25),
         ])
     return A.Compose([])
 
@@ -105,11 +115,15 @@ class CellOneFormerDataset(Dataset):
                     mask = load_instance_mask(m_path)
                     break
 
-        # Apply spatial & radiometric augmentations
+        # Apply spatial & radiometric augmentations (cast mask to uint16 for OpenCV warpAffine safety)
         if mask is not None:
-            augmented = self.transforms(image=image, mask=mask)
+            orig_image, orig_mask = image.copy(), mask.copy()
+            augmented = self.transforms(image=image, mask=mask.astype(np.uint16))
             image = augmented["image"]
-            mask = augmented["mask"]
+            mask = augmented["mask"].astype(np.int32)
+            # If geometric transform pushed edge cells out of frame, restore un-transformed pair
+            if mask.max() == 0 and orig_mask.max() > 0:
+                image, mask = orig_image, orig_mask
         else:
             augmented = self.transforms(image=image)
             image = augmented["image"]

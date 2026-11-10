@@ -79,11 +79,20 @@ class SlidingWindowTiler:
         """
         h, w = image.shape[:2]
 
-        # Ensure image is 3-channel for transformer backbones
+        # Ensure image is 3-channel (H, W, 3) for transformer backbones
         if image.ndim == 2:
             image = np.stack([image] * 3, axis=-1)
-        elif image.shape[-1] == 1:
-            image = np.repeat(image, 3, axis=-1)
+        elif image.ndim == 3:
+            if image.shape[0] in (1, 2, 3, 4) and image.shape[0] < image.shape[1] and image.shape[0] < image.shape[2]:
+                image = np.transpose(image, (1, 2, 0))
+            if image.shape[-1] == 1:
+                image = np.repeat(image, 3, axis=-1)
+            elif image.shape[-1] == 2:
+                ch3 = np.zeros_like(image[..., :1])
+                image = np.concatenate([image, ch3], axis=-1)
+            elif image.shape[-1] > 3:
+                image = image[..., :3]
+        h, w = image.shape[:2]
 
         # Pad image and mask if smaller than tile_size
         pad_y = max(0, self.tile_size - h)
@@ -130,22 +139,62 @@ class SlidingWindowTiler:
         return tiles
 
 
-def load_microscopy_image(path: str) -> np.ndarray:
-    """Reads a microscopy image from PNG, JPG, or TIFF format, normalized to uint8 0-255."""
+def load_microscopy_image(
+    path: str,
+    percentile_norm: bool = True,
+    apply_clahe: bool = False,
+) -> np.ndarray:
+    """
+    Reads a microscopy image from PNG, JPG, or TIFF format, normalized to uint8 0-255.
+    Applies robust 1%-99% percentile normalization to prevent hot-pixel saturation
+    across brightfield, fluorescence, phase-contrast, and DIC modalities.
+    """
     path = str(path)
     if path.lower().endswith((".tif", ".tiff")) and tifffile is not None:
         img = tifffile.imread(path)
     else:
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is not None and img.ndim == 3 and img.shape[-1] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     if img is None:
         raise FileNotFoundError(f"Failed to read image at {path}")
 
-    # Handle float or 16-bit TIFF normalization
-    if img.dtype == np.uint16:
+    # Normalize multi-channel layouts (e.g., (C, H, W) TIFFs or RGBA) into (H, W, 3) or (H, W)
+    if img.ndim == 3:
+        if img.shape[0] in (1, 2, 3, 4) and img.shape[0] < img.shape[1] and img.shape[0] < img.shape[2]:
+            img = np.transpose(img, (1, 2, 0))
+        if img.shape[-1] == 1:
+            img = img[..., 0]
+        elif img.shape[-1] == 2:
+            img = np.concatenate([img, np.zeros_like(img[..., :1])], axis=-1)
+        elif img.shape[-1] > 3:
+            img = img[..., :3]
+
+    # Robust 1%-99% percentile contrast normalization for 16-bit / float / low-contrast images
+    if percentile_norm and (img.dtype != np.uint8 or np.ptp(img) < 50):
+        img_f = img.astype(np.float32)
+        p1, p99 = np.percentile(img_f, (1.0, 99.0))
+        if p99 > p1:
+            img = np.clip((img_f - p1) / (p99 - p1) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            img = np.zeros_like(img, dtype=np.uint8)
+    elif img.dtype == np.uint16:
         img = (img / 256.0).astype(np.uint8)
     elif np.issubdtype(img.dtype, np.floating):
         img = (np.clip(img, 0, 1) * 255.0).astype(np.uint8)
+
+    if apply_clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        if img.ndim == 2:
+            img = clahe.apply(img)
+        elif img.ndim == 3 and img.shape[-1] == 3:
+            lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+            lab[..., 0] = clahe.apply(lab[..., 0])
+            img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
 
     return img
 
@@ -208,6 +257,6 @@ def generate_synthetic_cell_data(
         img_rgb = np.stack([bg] * 3, axis=-1)
 
         cv2.imwrite(str(raw_images_dir / f"synthetic_sample_{i:03d}.png"), img_rgb)
-        cv2.imwrite(str(raw_masks_dir / f"synthetic_sample_{i:03d}_mask.png"), mask)
+        cv2.imwrite(str(raw_masks_dir / f"synthetic_sample_{i:03d}_mask.png"), mask.astype(np.uint16))
 
     print(f"[Tiler] Synthetic dataset created successfully in {output_dir}")

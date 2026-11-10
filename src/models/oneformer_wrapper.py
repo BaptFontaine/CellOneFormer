@@ -121,15 +121,29 @@ class CellOneFormerModule(nn.Module):
             if task_inputs.shape[0] == 1 and pixel_values.shape[0] > 1:
                 task_inputs = task_inputs.repeat(pixel_values.shape[0], 1)
 
-        outputs = self.model(
-            pixel_values=pixel_values,
-            pixel_mask=pixel_mask,
-            text_inputs=text_inputs,
-            task_inputs=task_inputs,
-            mask_labels=mask_labels,
-            class_labels=class_labels,
-            **kwargs,
-        )
+        # Prevent OneFormerModel from requiring text_inputs during eval or when text_inputs is omitted
+        prev_cfg_train = getattr(self.model.config, "is_training", False)
+        prev_mdl_train = getattr(getattr(self.model, "model", None), "is_training", False)
+        active_text_training = bool(self.training and text_inputs is not None and mask_labels is not None)
+        self.model.config.is_training = active_text_training
+        if hasattr(self.model, "model"):
+            self.model.model.is_training = active_text_training
+
+        try:
+            outputs = self.model(
+                pixel_values=pixel_values,
+                pixel_mask=pixel_mask,
+                text_inputs=text_inputs if active_text_training else None,
+                task_inputs=task_inputs,
+                mask_labels=mask_labels,
+                class_labels=class_labels,
+                **kwargs,
+            )
+        finally:
+            self.model.config.is_training = prev_cfg_train
+            if hasattr(self.model, "model"):
+                self.model.model.is_training = prev_mdl_train
+
         return outputs
 
     def post_process_instances(

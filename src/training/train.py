@@ -23,10 +23,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import cv2
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from src.dataset.dataset_loader import CellOneFormerDataset, collate_fn_oneformer
@@ -37,6 +38,7 @@ from src.dataset.tiler import (
     load_instance_mask,
 )
 from src.models.oneformer_wrapper import CellOneFormerModule
+from src.utils.metrics import evaluate_instances_at_threshold
 
 
 def parse_args():
@@ -46,6 +48,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda/cpu)")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Override gradient accumulation steps")
+    parser.add_argument("--mixed-precision", type=str, default=None, help="Override mixed precision (no, fp16, bf16)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     return parser.parse_args()
@@ -144,8 +148,12 @@ def tile_and_save_split(
 
         tiles = tiler.tile_image_and_mask(img, mask)
         for t_idx, tile in enumerate(tiles):
+            # Skip pure empty background tiles when ground-truth masks are provided
+            if tile["mask"] is not None and tile.get("num_cells", 0) == 0:
+                continue
             save_img_path = out_img_dir / f"{img_path.stem}_tile{t_idx:03d}.png"
-            cv2.imwrite(str(save_img_path), tile["image"])
+            tile_bgr = cv2.cvtColor(tile["image"], cv2.COLOR_RGB2BGR) if tile["image"].ndim == 3 else tile["image"]
+            cv2.imwrite(str(save_img_path), tile_bgr)
             if tile["mask"] is not None:
                 save_msk_path = out_msk_dir / f"{img_path.stem}_tile{t_idx:03d}_mask.png"
                 cv2.imwrite(str(save_msk_path), tile["mask"].astype(np.uint16))
@@ -234,6 +242,55 @@ def prepare_tiled_data(cfg, is_dry_run=False):
         print(f"[Setup] Generated {n_val_tiles} validation/tuning tiles.")
 
 
+def validate_epoch_f1(
+    model_module: CellOneFormerModule,
+    val_loader: DataLoader,
+    device: torch.device,
+    score_thresh: float = 0.2,
+    max_batches: int = 25,
+) -> float:
+    """Computes mean F1@0.5 score on validation tiles."""
+    model_module.eval()
+    f1_scores = []
+
+    with torch.no_grad():
+        for b_idx, batch in enumerate(val_loader):
+            if b_idx >= max_batches:
+                break
+            if "mask_labels" not in batch or not batch["mask_labels"]:
+                continue
+
+            pixel_values = batch["pixel_values"].to(device)
+            task_inputs = batch.get("task_inputs")
+            if task_inputs is not None:
+                task_inputs = task_inputs.to(device)
+            pixel_mask = batch.get("pixel_mask")
+            if pixel_mask is not None:
+                pixel_mask = pixel_mask.to(device)
+
+            outputs = model_module(
+                pixel_values=pixel_values,
+                pixel_mask=pixel_mask,
+                task_inputs=task_inputs,
+            )
+
+            h_t, w_t = pixel_values.shape[-2], pixel_values.shape[-1]
+            target_sizes = [(h_t, w_t)] * pixel_values.shape[0]
+            preds = model_module.post_process_instances(
+                outputs,
+                target_sizes=target_sizes,
+                threshold=score_thresh,
+            )
+
+            for i, pred_dict in enumerate(preds):
+                gt_t = batch["mask_labels"][i].detach().cpu().numpy() > 0.5
+                pred_m = np.array(pred_dict["masks"], dtype=bool) if len(pred_dict["masks"]) > 0 else np.empty((0, h_t, w_t), dtype=bool)
+                res = evaluate_instances_at_threshold(pred_m, gt_t, iou_threshold=0.5)
+                f1_scores.append(res["f1"])
+
+    return float(np.mean(f1_scores)) if len(f1_scores) > 0 else 0.0
+
+
 def main():
     args = parse_args()
 
@@ -243,6 +300,7 @@ def main():
     epochs = args.epochs or cfg["training"]["epochs"]
     batch_size = args.batch_size or cfg["training"]["batch_size"]
     lr = args.lr or cfg["training"]["learning_rate"]
+    backbone_lr = cfg["training"].get("backbone_learning_rate", lr * 0.1)
     device = torch.device(args.device)
 
     print("=" * 60)
@@ -282,19 +340,29 @@ def main():
     val_img_dir = str(Path(cfg["data"]["processed_dir"]) / "val" / "images")
     val_msk_dir = str(Path(cfg["data"]["processed_dir"]) / "val" / "masks")
 
+    # Auto-detect num_queries from checkpoint when resuming
+    num_queries = cfg["model"]["num_queries"]
+    resume_state = None
+    if args.resume and os.path.exists(args.resume):
+        print(f"[Training] Resuming from existing checkpoint: {args.resume}")
+        resume_state = torch.load(args.resume, map_location=device)
+        for k, v in resume_state.items():
+            if "query_embed.weight" in k and hasattr(v, "shape"):
+                num_queries = int(v.shape[0])
+                break
+
     # Load Model & Processor
     model_module = CellOneFormerModule(
         pretrained_model_name=cfg["model"]["pretrained_model_name"],
         num_classes=cfg["model"]["num_classes"],
-        num_queries=cfg["model"]["num_queries"],
+        num_queries=num_queries,
         is_training=True,
     )
-    if args.resume and os.path.exists(args.resume):
-        print(f"[Training] Resuming from existing checkpoint: {args.resume}")
-        model_module.load_state_dict(torch.load(args.resume, map_location=device), strict=False)
+    if resume_state is not None:
+        model_module.load_state_dict(resume_state, strict=False)
     model_module.to(device)
 
-    # Training Dataset & DataLoader
+    # Training & Validation Datasets
     train_dataset = CellOneFormerDataset(
         images_dir=train_img_dir,
         masks_dir=train_msk_dir,
@@ -311,9 +379,54 @@ def main():
         num_workers=2,
     )
 
-    optimizer = AdamW(model_module.parameters(), lr=lr, weight_decay=cfg["training"]["weight_decay"])
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    use_amp = (cfg["training"]["mixed_precision"] in ("fp16", "bf16")) and device.type == "cuda"
+    val_loader = None
+    if os.path.exists(val_img_dir) and len(os.listdir(val_img_dir)) > 0:
+        try:
+            val_dataset = CellOneFormerDataset(
+                images_dir=val_img_dir,
+                masks_dir=val_msk_dir,
+                processor=model_module.processor,
+                task=cfg["model"]["task"],
+                is_train=False,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn_oneformer,
+                num_workers=2,
+            )
+        except Exception:
+            val_loader = None
+
+    # Differentiated Layer-wise Learning Rate (Backbone vs Transformer Decoder)
+    backbone_params = []
+    decoder_params = []
+    for name, param in model_module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "pixel_level_module.encoder" in name:
+            backbone_params.append(param)
+        else:
+            decoder_params.append(param)
+
+    param_groups = [
+        {"params": backbone_params, "lr": backbone_lr},
+        {"params": decoder_params, "lr": lr},
+    ]
+    optimizer = AdamW(param_groups, lr=lr, weight_decay=cfg["training"]["weight_decay"])
+
+    # Linear Warmup + Cosine Annealing Schedule
+    warmup_epochs = max(1, int(epochs * cfg["training"].get("warmup_ratio", 0.1)))
+    if epochs > warmup_epochs:
+        warmup_sched = LinearLR(optimizer, start_factor=0.2, total_iters=warmup_epochs)
+        cosine_sched = CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs))
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+
+    mp_mode = args.mixed_precision or cfg["training"]["mixed_precision"]
+    use_amp = (mp_mode in ("fp16", "bf16")) and device.type == "cuda"
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     except (TypeError, AttributeError):
@@ -322,9 +435,11 @@ def main():
     output_dir = Path(cfg["training"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    grad_accum_steps = max(1, int(cfg["training"].get("gradient_accumulation_steps", 1)))
-    print(f"\n[Training] Starting remote training for {epochs} epochs on {device} (batch_size={batch_size}, grad_accum={grad_accum_steps})...")
+    grad_accum_steps = args.gradient_accumulation_steps or max(1, int(cfg["training"].get("gradient_accumulation_steps", 1)))
+    eval_every = max(1, int(cfg["training"].get("eval_every_epochs", 1)))
+    print(f"\n[Training] Starting remote training for {epochs} epochs on {device} (batch_size={batch_size}, grad_accum={grad_accum_steps}, backbone_lr={backbone_lr}, decoder_lr={lr})...")
     best_loss = float("inf")
+    best_f1 = -1.0
 
     for epoch in range(1, epochs + 1):
         model_module.train()
@@ -375,15 +490,32 @@ def main():
         scheduler.step()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        print(f"[Epoch {epoch}/{epochs}] Average Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        # Save checkpoint
+        val_f1_str = ""
+        val_f1 = -1.0
+        if val_loader is not None and (epoch % eval_every == 0 or epoch == epochs):
+            val_f1 = validate_epoch_f1(
+                model_module,
+                val_loader,
+                device,
+                score_thresh=cfg["inference"].get("score_threshold", 0.2),
+            )
+            val_f1_str = f" | Val F1@0.5: {val_f1:.4f}"
+
+        print(f"[Epoch {epoch}/{epochs}] Average Loss: {avg_loss:.4f}{val_f1_str} | Decoder LR: {optimizer.param_groups[-1]['lr']:.6f}")
+
+        # Save checkpoint if F1 improved or training loss improved
+        is_better = (val_f1 > best_f1) if val_f1 >= 0 else (avg_loss < best_loss)
         if avg_loss < best_loss:
             best_loss = avg_loss
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+
+        if is_better:
             save_path = output_dir / "oneformer_cells_best.pt"
             torch.save(model_module.state_dict(), save_path)
-            print(f"[*] Best checkpoint saved to {save_path} (loss: {best_loss:.4f})")
-            
+            print(f"[*] Best checkpoint saved to {save_path} (loss: {avg_loss:.4f}{val_f1_str})")
+
             # Automatic persistent backup to Google Drive
             drive_backup_dir = Path("/content/drive/MyDrive/cell_oneformer_real_checkpoints")
             if drive_backup_dir.parent.exists():
