@@ -167,8 +167,12 @@ class CellOneFormerModule(nn.Module):
             mask_logits = outputs.masks_queries_logits[b:b+1]  # (1, num_queries, H_m, W_m)
 
             probs = torch.softmax(class_logits, dim=-1)
-            # Class 1 corresponds to "cell"
-            cell_scores = probs[:, 1]
+            # In OneFormer/Mask2Former, the last index (-1, i.e., index 2) is the "no-object" (empty) class.
+            # Foreground cell queries may activate class 1 (direct label) or class 0 (if trained with do_reduce_labels=True).
+            if probs.shape[-1] >= 3:
+                cell_scores = torch.maximum(probs[:, 1], probs[:, 0])
+            else:
+                cell_scores = probs[:, 1]
 
             # Upsample predicted mask logits to target crop dimensions
             upsampled_masks = torch.nn.functional.interpolate(

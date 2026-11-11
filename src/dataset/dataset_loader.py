@@ -142,76 +142,50 @@ class CellOneFormerDataset(Dataset):
         else:
             task_key = "panoptic"
 
-        # If processor is available, preprocess for OneFormer
+        # If processor is available, preprocess image and build exact instance mask_labels/class_labels directly
         if self.processor is not None:
-            if hasattr(self.processor, "image_processor"):
-                ip = self.processor.image_processor
-                if getattr(ip, "num_text", None) is None:
-                    ip.num_text = 150
-                if getattr(ip, "ignore_index", None) is None:
-                    ip.ignore_index = 0
-                # Ensure class 1 (cell) is explicitly recognized as a countable "thing"
-                ip.thing_ids = [1]
-                if hasattr(ip, "class_names") and isinstance(ip.class_names, list):
-                    if "cell" not in ip.class_names:
-                        ip.class_names.append("cell")
-                if hasattr(ip, "metadata") and isinstance(ip.metadata, dict):
-                    ip.metadata["thing_ids"] = [1]
-                    ip.metadata["1"] = "cell"
-                    ip.metadata[1] = "cell"
-                    ip.metadata["0"] = "background"
-                    ip.metadata[0] = "background"
-                    if "class_names" in ip.metadata and isinstance(ip.metadata["class_names"], list):
-                        if "cell" not in ip.metadata["class_names"]:
-                            ip.metadata["class_names"].append("cell")
-
-            # If mask is missing or has no cells during training, guarantee at least 1 instance without recursion
-            if (mask is None or mask.max() == 0) and self.is_train:
-                h_img, w_img = image.shape[:2]
-                mask = np.zeros((h_img, w_img), dtype=np.int32)
-                cv2.circle(mask, (w_img // 2, h_img // 2), min(h_img, w_img) // 4, 1, -1)
+            inputs = self.processor(
+                images=pil_image,
+                task_inputs=[task_key],
+                return_tensors="pt",
+            )
+            item = {}
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    item[k] = v.squeeze(0)
+                elif isinstance(v, list) and len(v) > 0:
+                    item[k] = v[0]
+                else:
+                    item[k] = v
 
             if mask is not None:
-                # Build instance_id_to_semantic_id dictionary:
-                # 0 is background (class 0), and all non-zero instance IDs are cells (class 1)
-                unique_ids = np.unique(mask)
-                instance_id_to_semantic_id = {int(uid): 1 for uid in unique_ids}
-                instance_id_to_semantic_id[0] = 0
+                _, h_pv, w_pv = item["pixel_values"].shape
+                if mask.shape[0] != h_pv or mask.shape[1] != w_pv:
+                    mask_resized = cv2.resize(
+                        mask.astype(np.uint16),
+                        (w_pv, h_pv),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(np.int32)
+                else:
+                    mask_resized = mask
 
-                inputs = self.processor(
-                    images=pil_image,
-                    task_inputs=[task_key],
-                    segmentation_maps=mask,
-                    instance_id_to_semantic_id=instance_id_to_semantic_id,
-                    return_tensors="pt",
-                )
-                # Unpack leading batch dimension added by processor
-                item = {}
-                for k, v in inputs.items():
-                    if isinstance(v, torch.Tensor):
-                        item[k] = v.squeeze(0)
-                    elif isinstance(v, list) and len(v) > 0:
-                        item[k] = v[0]
-                    else:
-                        item[k] = v
-                item["image_path"] = img_path
-                return item
-            else:
-                inputs = self.processor(
-                    images=pil_image,
-                    task_inputs=[task_key],
-                    return_tensors="pt",
-                )
-                item = {}
-                for k, v in inputs.items():
-                    if isinstance(v, torch.Tensor):
-                        item[k] = v.squeeze(0)
-                    elif isinstance(v, list) and len(v) > 0:
-                        item[k] = v[0]
-                    else:
-                        item[k] = v
-                item["image_path"] = img_path
-                return item
+                instance_ids = [int(uid) for uid in np.unique(mask_resized) if uid > 0]
+                if len(instance_ids) == 0 and self.is_train:
+                    # Fallback single small instance only if tile is completely empty
+                    fallback = np.zeros((h_pv, w_pv), dtype=np.float32)
+                    cv2.circle(fallback, (w_pv // 2, h_pv // 2), 12, 1.0, -1)
+                    item["mask_labels"] = torch.from_numpy(fallback).unsqueeze(0)
+                    item["class_labels"] = torch.ones(1, dtype=torch.long)
+                elif len(instance_ids) > 0:
+                    bin_masks = np.stack(
+                        [(mask_resized == uid).astype(np.float32) for uid in instance_ids],
+                        axis=0,
+                    )
+                    item["mask_labels"] = torch.from_numpy(bin_masks)
+                    item["class_labels"] = torch.ones(len(instance_ids), dtype=torch.long)
+
+            item["image_path"] = img_path
+            return item
 
         return {
             "image": torch.tensor(image).permute(2, 0, 1).float() / 255.0,

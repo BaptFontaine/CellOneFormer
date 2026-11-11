@@ -139,6 +139,9 @@ def tile_and_save_split(
     if is_dry_run:
         pairs = pairs[:2]
     elif max_samples is not None and max_samples > 0:
+        import random
+        pairs = list(pairs)
+        random.Random(42).shuffle(pairs)
         pairs = pairs[:max_samples]
 
     tile_count = 0
