@@ -188,11 +188,17 @@ def prepare_tiled_data(cfg, is_dry_run=False):
     test_source = find_case_dir(cellseg_root, "testing")
 
     processed_train_img = Path(cfg["data"]["processed_dir"]) / "train" / "images"
+    processed_train_msk = Path(cfg["data"]["processed_dir"]) / "train" / "masks"
     processed_val_img = Path(cfg["data"]["processed_dir"]) / "val" / "images"
 
-    # If processed data already exists, skip
-    if processed_train_img.exists() and len(list(processed_train_img.glob("*.png"))) > 0:
-        print(f"[Setup] Processed tiles already present in {cfg['data']['processed_dir']}. Skipping tiling.")
+    # Only skip tiling if BOTH images and masks exist and are non-empty
+    if (
+        processed_train_img.exists()
+        and processed_train_msk.exists()
+        and len(list(processed_train_img.glob("*.png"))) > 0
+        and len(list(processed_train_msk.glob("*.png"))) > 0
+    ):
+        print(f"[Setup] Processed tiles and masks already present in {cfg['data']['processed_dir']}. Skipping tiling.")
         return
 
     # Check if raw files exist

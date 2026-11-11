@@ -113,7 +113,7 @@ class SlidingWindowTiler:
 
             if mask is not None:
                 raw_mask_crop = mask[y1:y2, x1:x2].copy()
-                remapped_mask = np.zeros_like(raw_mask_crop, dtype=np.int32)
+                remapped_mask = np.zeros_like(raw_mask_crop, dtype=np.uint16)
 
                 # Re-index cells in this crop to 1..K and filter tiny remnants
                 unique_ids = np.unique(raw_mask_crop)
@@ -151,7 +151,12 @@ def load_microscopy_image(
     """
     path = str(path)
     if path.lower().endswith((".tif", ".tiff")) and tifffile is not None:
-        img = tifffile.imread(path)
+        import logging
+        logging.getLogger("tifffile").setLevel(logging.ERROR)
+        try:
+            img = tifffile.imread(path)
+        except Exception:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     else:
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is not None and img.ndim == 3 and img.shape[-1] == 3:
@@ -171,18 +176,14 @@ def load_microscopy_image(
         elif img.shape[-1] > 3:
             img = img[..., :3]
 
-    # Robust 1%-99% percentile contrast normalization for 16-bit / float / low-contrast images
-    if percentile_norm and (img.dtype != np.uint8 or np.ptp(img) < 50):
+    # Robust 1%-99% percentile contrast normalization for any non-uint8 (int16, uint16, int32, float) or low-contrast image
+    if img.dtype != np.uint8 or (percentile_norm and np.ptp(img) < 50):
         img_f = img.astype(np.float32)
         p1, p99 = np.percentile(img_f, (1.0, 99.0))
         if p99 > p1:
             img = np.clip((img_f - p1) / (p99 - p1) * 255.0, 0, 255).astype(np.uint8)
         else:
-            img = np.zeros_like(img, dtype=np.uint8)
-    elif img.dtype == np.uint16:
-        img = (img / 256.0).astype(np.uint8)
-    elif np.issubdtype(img.dtype, np.floating):
-        img = (np.clip(img, 0, 1) * 255.0).astype(np.uint8)
+            img = np.clip(img_f, 0, 255).astype(np.uint8)
 
     if apply_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
