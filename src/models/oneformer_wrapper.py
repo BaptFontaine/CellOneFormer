@@ -83,6 +83,14 @@ class CellOneFormerModule(nn.Module):
             pass
         if hasattr(self.model, "criterion"):
             self.model.criterion.loss_contrastive = lambda *args, **kwargs: {}
+            if hasattr(self.model.criterion, "losses"):
+                self.model.criterion.losses = [l for l in self.model.criterion.losses if l != "contrastive"]
+            # Fix MISMATCH reinit of criterion.empty_weight: must be [1.0, ..., 1.0, 0.1], never random normal!
+            if hasattr(self.model.criterion, "empty_weight"):
+                eos_coef = float(getattr(self.model.config, "no_object_weight", 0.1))
+                proper_empty_weight = torch.ones(self.num_classes + 1, dtype=self.model.criterion.empty_weight.dtype)
+                proper_empty_weight[-1] = eos_coef
+                self.model.criterion.empty_weight.data.copy_(proper_empty_weight)
 
         if freeze_backbone:
             print("[Model] Freezing backbone layers for transfer learning...")
@@ -150,14 +158,19 @@ class CellOneFormerModule(nn.Module):
         self,
         outputs: Any,
         target_sizes: List[tuple],
-        threshold: float = 0.2,
+        threshold: float = 0.25,
         mask_threshold: float = 0.5,
         min_area: int = 15,
+        max_area: int = 4500,
     ) -> List[Dict[str, Any]]:
         """
         Direct transformer query decoding into binary instance masks.
-        Bypasses ADE20K pre-trained metadata dictionaries for robust custom 2-class cell segmentation.
+        Uses Mask2Former/OneFormer mask-confidence weighting (cls_score * mask_ness),
+        connected-component splitting, and border-strip / solidity filtering.
         """
+        import cv2
+        import numpy as np
+
         batch_size = outputs.class_queries_logits.shape[0]
         results = []
 
@@ -167,8 +180,7 @@ class CellOneFormerModule(nn.Module):
             mask_logits = outputs.masks_queries_logits[b:b+1]  # (1, num_queries, H_m, W_m)
 
             probs = torch.softmax(class_logits, dim=-1)
-            # In OneFormer/Mask2Former, the last index (-1, i.e., index 2) is the "no-object" (empty) class.
-            # Foreground cell queries may activate class 1 (direct label) or class 0 (if trained with do_reduce_labels=True).
+            # Foreground cell probability (1.0 - no_object_prob, or max of foreground classes)
             if probs.shape[-1] >= 3:
                 cell_scores = torch.maximum(probs[:, 1], probs[:, 0])
             else:
@@ -185,17 +197,57 @@ class CellOneFormerModule(nn.Module):
             masks_list = []
             scores_list = []
 
-            # Sort candidate queries by descending confidence
+            # Sort candidate queries by descending class confidence
             sorted_indices = torch.argsort(cell_scores, descending=True)
             for idx in sorted_indices:
-                score = float(cell_scores[idx].item())
-                if score < threshold:
+                cls_score = float(cell_scores[idx].item())
+                if cls_score < threshold * 0.75:
                     break
-                bin_mask = (upsampled_masks[idx] >= mask_threshold).detach().cpu().numpy()
-                area = int(bin_mask.sum())
-                if area >= min_area:
-                    masks_list.append(bin_mask)
-                    scores_list.append(score)
+
+                prob_map = upsampled_masks[idx]
+                bin_mask_t = prob_map >= mask_threshold
+                area_total = int(bin_mask_t.sum().item())
+                if area_total < min_area:
+                    continue
+
+                # Mask2Former mask-ness score: mean sigmoid probability inside the active mask
+                mask_ness = float(prob_map[bin_mask_t].mean().item())
+                combined_score = cls_score * mask_ness
+                if combined_score < threshold:
+                    continue
+
+                bin_mask_np = bin_mask_t.detach().cpu().numpy().astype(np.uint8)
+
+                # Split disconnected blobs predicted by the same query into clean individual instances
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask_np, connectivity=8)
+                for comp_id in range(1, num_labels):
+                    comp_area = int(stats[comp_id, cv2.CC_STAT_AREA])
+                    if comp_area < min_area or (max_area is not None and comp_area > max_area):
+                        continue
+
+                    bw = int(stats[comp_id, cv2.CC_STAT_WIDTH])
+                    bh = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
+                    bx = int(stats[comp_id, cv2.CC_STAT_LEFT])
+                    by = int(stats[comp_id, cv2.CC_STAT_TOP])
+
+                    # Reject elongated tile-seam border strips (e.g. horizontal/vertical illumination artifacts)
+                    aspect = max(bw, bh) / max(1.0, min(bw, bh))
+                    touches_border = (bx <= 2) or (by <= 2) or (bx + bw >= target_w - 2) or (by + bh >= target_h - 2)
+                    if touches_border and aspect > 4.5 and comp_area > 300:
+                        continue
+
+                    comp_mask = (labels == comp_id)
+                    # Check solidity (area / convex hull area) for large sprawling blobs
+                    if comp_area > 250:
+                        cnts, _ = cv2.findContours(comp_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            hull_area = cv2.contourArea(cv2.convexHull(cnts[0]))
+                            solidity = comp_area / max(1.0, hull_area)
+                            if solidity < 0.42:
+                                continue
+
+                    masks_list.append(comp_mask)
+                    scores_list.append(combined_score)
 
             results.append({
                 "masks": masks_list,

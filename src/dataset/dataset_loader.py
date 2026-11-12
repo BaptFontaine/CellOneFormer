@@ -199,10 +199,10 @@ def collate_fn_oneformer(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Custom collator for OneFormer batches handling variable-length mask labels.
     """
-    # Filter out any corrupt items that lack mask_labels during training
-    valid_batch = [b for b in batch if "mask_labels" in b and "pixel_values" in b]
+    # Filter out any items that lack mask_labels or pixel_values during training
+    valid_batch = [b for b in batch if isinstance(b, dict) and "mask_labels" in b and "pixel_values" in b and len(b["mask_labels"]) > 0]
     if len(valid_batch) == 0:
-        valid_batch = batch
+        return {}
 
     keys = valid_batch[0].keys()
     collated = {}

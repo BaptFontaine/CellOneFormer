@@ -457,7 +457,7 @@ def main():
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
         for step, batch in enumerate(pbar):
-            if "mask_labels" not in batch or batch["mask_labels"] is None or len(batch["mask_labels"]) == 0:
+            if not batch or "pixel_values" not in batch or "mask_labels" not in batch or not batch["mask_labels"]:
                 continue
             pixel_values = batch["pixel_values"].to(device)
             text_inputs = batch.get("text_inputs")
@@ -485,14 +485,20 @@ def main():
                 loss = outputs.loss
                 loss_scaled = loss / grad_accum_steps
 
+            if not torch.isfinite(loss):
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss_scaled).backward()
 
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model_module.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            epoch_loss += loss.item()
+            epoch_loss += float(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = epoch_loss / max(1, len(train_loader))

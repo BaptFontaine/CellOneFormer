@@ -159,15 +159,25 @@ class TileStitcher:
                 area_j = all_areas[idx_j]
                 union = area_i + area_j - intersection
                 iou = intersection / union if union > 0 else 0.0
+                io_min = intersection / min(area_i, area_j) if min(area_i, area_j) > 0 else 0.0
 
-                if iou >= self.iou_threshold:
+                # Suppress if IoU exceeds threshold OR one mask is mostly contained inside the other (nested duplicate)
+                if iou >= self.iou_threshold or io_min >= 0.65:
                     suppressed[idx_j] = True
 
         kept_masks = all_global_masks[keep_indices]
 
-        # 4. Construct integer label matrix (painters order from lowest to highest score so top cells stay sharp)
+        # 4. Construct integer label matrix: highest-confidence masks claim pixels first (no overlap overwrite)
         label_matrix = np.zeros((full_height, full_width), dtype=np.int32)
-        for cell_id, mask in enumerate(kept_masks, 1):
-            label_matrix[mask] = cell_id
+        final_kept_masks = []
+        cell_id = 1
+        for mask in kept_masks:
+            unclaimed = mask & (label_matrix == 0)
+            if int(unclaimed.sum()) >= self.min_area:
+                label_matrix[unclaimed] = cell_id
+                final_kept_masks.append(unclaimed)
+                cell_id += 1
 
-        return label_matrix, kept_masks
+        if len(final_kept_masks) == 0:
+            return label_matrix, np.empty((0, full_height, full_width), dtype=bool)
+        return label_matrix, np.array(final_kept_masks, dtype=bool)

@@ -38,8 +38,8 @@ training:
   weight_decay: 0.05
   warmup_ratio: 0.1
   lr_scheduler_type: "cosine"
-  mixed_precision: "fp16"          # Options: "no", "fp16", "bf16"
-  eval_every_epochs: 2
+  mixed_precision: "no"            # Options: "no" (fp32 prevents NaN in Hungarian matcher), "bf16"
+  eval_every_epochs: 1
   save_total_limit: 3
   early_stopping_patience: 10
   use_wandb: false
