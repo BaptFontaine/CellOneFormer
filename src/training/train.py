@@ -72,17 +72,24 @@ def find_image_mask_pairs(folder_path: Path) -> List[Tuple[Path, Optional[Path]]
         lbl_sub = folder_path / "masks"
 
     if img_sub.exists():
-        exts = ("*.png", "*.tif", "*.tiff", "*.jpg", "*.jpeg")
-        img_files = []
-        for ext in exts:
-            img_files.extend(list(img_sub.glob(ext)))
-        img_files.sort()
+        valid_exts = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"}
+        img_files = sorted([f for f in img_sub.iterdir() if f.is_file() and f.suffix.lower() in valid_exts])
+
+        # Build fast lookup map of label files by stem and stripped stem
+        lbl_lookup = {}
+        if lbl_sub.exists():
+            for lf in lbl_sub.iterdir():
+                if lf.is_file() and lf.suffix.lower() in valid_exts:
+                    l_stem = lf.stem
+                    lbl_lookup[l_stem] = lf
+                    for sfx in ("_label", "_mask", "_gt", "-label", "-mask"):
+                        if l_stem.lower().endswith(sfx):
+                            lbl_lookup[l_stem[: -len(sfx)]] = lf
 
         for img_p in img_files:
             stem = img_p.stem
-            # Check corresponding mask in labels dir
-            mask_p = None
-            if lbl_sub.exists():
+            mask_p = lbl_lookup.get(stem)
+            if mask_p is None and lbl_sub.exists():
                 for candidate in [
                     lbl_sub / f"{stem}.png",
                     lbl_sub / f"{stem}.tif",
