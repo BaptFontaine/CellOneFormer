@@ -10,7 +10,7 @@ data:
   dataset_name: "DatasetCellSeg"   # Folders expected: training/, tuning/, testing/
   processed_dir: "data/processed"
   tile_size: 512                   # Size of square patches (H, W)
-  tile_overlap: 64                 # Overlap in pixels between adjacent tiles
+  tile_overlap: 96                 # Overlap in pixels between adjacent tiles (covers larger cells)
   min_cell_area: 15                # Filter out spurious cell masks < N pixels
   max_cell_area: 8000              # Filter out giant spurious background artifacts > N pixels
   percentile_norm: true            # Robust 1%-99% percentile normalization for multi-modal microscopy
@@ -31,15 +31,15 @@ training:
   output_dir: "checkpoints"
   logs_dir: "logs"
   epochs: 40
-  batch_size: 2                    # Set to 2 to prevent CUDA OOM on Colab 15GB T4/V100
-  gradient_accumulation_steps: 8   # Effective batch size = 2 * 8 = 16
+  batch_size: 4                    # Faster GPU utilization; effective batch = 4 * 4 = 16
+  gradient_accumulation_steps: 4   # Effective batch size = 4 * 4 = 16
   learning_rate: 1.0e-4
   backbone_learning_rate: 1.0e-5
   weight_decay: 0.05
   warmup_ratio: 0.1
   lr_scheduler_type: "cosine"
-  mixed_precision: "no"            # Options: "no" (fp32 prevents NaN in Hungarian matcher), "bf16"
-  eval_every_epochs: 1
+  mixed_precision: "auto"          # "auto" selects bf16 on L4/A100 and fp32 on T4 (prevents Hungarian matcher NaN)
+  eval_every_epochs: 2
   save_total_limit: 3
   early_stopping_patience: 10
   use_wandb: false
@@ -47,8 +47,8 @@ training:
 inference:
   batch_size: 4
   tile_size: 512
-  tile_overlap: 64
+  tile_overlap: 96
   iou_threshold_stitch: 0.5        # Soft-IoU threshold to deduplicate cells across seams
-  score_threshold: 0.2             # Minimum confidence threshold for instance prediction (adjusted for fine-tuned queries)
+  score_threshold: 0.25            # Minimum confidence threshold for instance prediction (adjusted for fine-tuned queries)
   gaussian_seam_weighting: true    # Weight central tile predictions higher than border predictions
   tta: false                       # Enable Test-Time Augmentation (horizontal/vertical flips)

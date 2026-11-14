@@ -176,12 +176,13 @@ def load_microscopy_image(
         elif img.shape[-1] > 3:
             img = img[..., :3]
 
-    # Robust 1%-99% percentile contrast normalization for any non-uint8 (int16, uint16, int32, float) or low-contrast image
-    if img.dtype != np.uint8 or (percentile_norm and np.ptp(img) < 50):
+    # Robust percentile contrast normalization for non-uint8 (int16, uint16, int32, float)
+    # or low-contrast 8-bit microscopy images (e.g., DIC / phase-contrast)
+    if img.dtype != np.uint8 or (percentile_norm and np.ptp(img) < 80):
         img_f = img.astype(np.float32)
-        p1, p99 = np.percentile(img_f, (1.0, 99.0))
-        if p99 > p1:
-            img = np.clip((img_f - p1) / (p99 - p1) * 255.0, 0, 255).astype(np.uint8)
+        p_low, p_high = np.percentile(img_f, (0.5, 99.8))
+        if p_high > p_low:
+            img = np.clip((img_f - p_low) / (p_high - p_low) * 255.0, 0, 255).astype(np.uint8)
         else:
             img = np.clip(img_f, 0, 255).astype(np.uint8)
 

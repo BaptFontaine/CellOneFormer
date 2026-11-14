@@ -7,6 +7,7 @@ import pytest
 
 from src.dataset.tiler import SlidingWindowTiler
 from src.utils.metrics import compute_iou_matrix, evaluate_instances_at_threshold
+from src.utils.morphometry import extract_cell_morphometry, summarize_morphometry
 from src.inference.stitcher import TileStitcher
 
 
@@ -60,3 +61,19 @@ def test_stitcher_deduplication():
     # The duplicate should be deduplicated, leaving exactly 1 cell
     assert len(kept_masks) == 1
     assert int(label_matrix.max()) == 1
+
+
+def test_morphometry_extraction():
+    label_matrix = np.zeros((100, 100), dtype=np.int32)
+    label_matrix[10:30, 10:30] = 1  # 20x20 = 400 px
+    label_matrix[50:70, 50:60] = 2  # 20x10 = 200 px
+
+    rows = extract_cell_morphometry(label_matrix, pixel_size_um=0.5)
+    assert len(rows) == 2
+    assert rows[0]["area_px"] == 400
+    assert rows[1]["area_px"] == 200
+    assert np.isclose(rows[0]["area_um2"], 100.0)
+
+    summary = summarize_morphometry(rows, label_matrix.shape)
+    assert summary["cell_count"] == 2
+    assert np.isclose(summary["confluence_pct"], 6.0)

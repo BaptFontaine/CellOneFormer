@@ -161,7 +161,7 @@ class CellOneFormerModule(nn.Module):
         threshold: float = 0.25,
         mask_threshold: float = 0.5,
         min_area: int = 15,
-        max_area: int = 4500,
+        max_area: Optional[int] = 8000,
     ) -> List[Dict[str, Any]]:
         """
         Direct transformer query decoding into binary instance masks.
@@ -180,31 +180,35 @@ class CellOneFormerModule(nn.Module):
             mask_logits = outputs.masks_queries_logits[b:b+1]  # (1, num_queries, H_m, W_m)
 
             probs = torch.softmax(class_logits, dim=-1)
-            # Foreground cell probability (1.0 - no_object_prob, or max of foreground classes)
-            if probs.shape[-1] >= 3:
-                cell_scores = torch.maximum(probs[:, 1], probs[:, 0])
-            else:
-                cell_scores = probs[:, 1]
+            # Class 0 is background, Class 1 is cell, Class 2 (last) is no_object.
+            # Only score foreground "cell" predictions (index 1).
+            cell_scores = probs[:, 1] if probs.shape[-1] > 1 else probs[:, 0]
 
-            # Upsample predicted mask logits to target crop dimensions
+            # Pre-filter candidate queries on GPU before upsampling masks to save compute & memory
+            keep_q = torch.nonzero(cell_scores >= threshold * 0.75, as_tuple=False).squeeze(-1)
+            if keep_q.numel() == 0:
+                results.append({"masks": [], "scores": []})
+                continue
+
+            kept_scores = cell_scores[keep_q]
+            order = torch.argsort(kept_scores, descending=True)
+            keep_q = keep_q[order]
+            kept_scores = kept_scores[order]
+
+            # Upsample only candidate predicted mask logits to target crop dimensions
             upsampled_masks = torch.nn.functional.interpolate(
-                mask_logits,
+                mask_logits[:, keep_q],
                 size=(target_h, target_w),
                 mode="bilinear",
                 align_corners=False,
-            )[0].sigmoid()  # (num_queries, target_h, target_w)
+            )[0].sigmoid()  # (K, target_h, target_w)
 
             masks_list = []
             scores_list = []
 
-            # Sort candidate queries by descending class confidence
-            sorted_indices = torch.argsort(cell_scores, descending=True)
-            for idx in sorted_indices:
-                cls_score = float(cell_scores[idx].item())
-                if cls_score < threshold * 0.75:
-                    break
-
-                prob_map = upsampled_masks[idx]
+            for k_idx in range(keep_q.numel()):
+                cls_score = float(kept_scores[k_idx].item())
+                prob_map = upsampled_masks[k_idx]
                 bin_mask_t = prob_map >= mask_threshold
                 area_total = int(bin_mask_t.sum().item())
                 if area_total < min_area:

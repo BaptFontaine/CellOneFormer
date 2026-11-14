@@ -1,7 +1,8 @@
 """
 End-to-end inference pipeline for full-field microscopy images.
 Slices large images into tiles, predicts cell masks with OneFormer,
-and stitches them back into global instance maps with Soft-IoU suppression.
+stitches them back into global instance maps with Soft-IoU suppression,
+and optionally extracts per-cell morphometric features.
 """
 
 import os
@@ -10,6 +11,7 @@ import argparse
 import yaml
 import numpy as np
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add project root to sys.path so 'from src...' always resolves cleanly
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +26,11 @@ from src.dataset.tiler import SlidingWindowTiler, load_microscopy_image, load_in
 from src.inference.stitcher import TileStitcher
 from src.models.oneformer_wrapper import CellOneFormerModule
 from src.utils.metrics import compute_challenge_benchmark_metrics
+from src.utils.morphometry import (
+    extract_cell_morphometry,
+    save_morphometry_csv,
+    summarize_morphometry,
+)
 
 
 def parse_args():
@@ -38,7 +45,11 @@ def parse_args():
     parser.add_argument("--score-threshold", type=float, default=None, help="Detection confidence threshold")
     parser.add_argument("--stitch-iou", type=float, default=None, help="Soft-IoU seam deduplication threshold")
     parser.add_argument("--min-area", type=int, default=None, help="Minimum cell area in pixels")
+    parser.add_argument("--max-area", type=int, default=None, help="Maximum cell area in pixels")
+    parser.add_argument("--tile-overlap", type=int, default=None, help="Tile overlap in pixels")
     parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (flips)")
+    parser.add_argument("--morphometry", action="store_true", help="Export per-cell morphometry CSV")
+    parser.add_argument("--pixel-size-um", type=float, default=None, help="Optional pixel size in micrometers for calibrated area")
     return parser.parse_args()
 
 
@@ -59,6 +70,65 @@ def colorize_instance_mask(label_matrix: np.ndarray) -> np.ndarray:
     return colored
 
 
+def create_overlay(image: np.ndarray, label_matrix: np.ndarray) -> np.ndarray:
+    """Renders colored instance masks and crisp white contours onto the RGB microscopy image."""
+    overlay = image.copy()
+    if overlay.ndim == 2:
+        overlay = np.stack([overlay] * 3, axis=-1)
+    elif overlay.shape[-1] > 3:
+        overlay = overlay[..., :3]
+
+    num_cells = int(label_matrix.max())
+    if num_cells == 0:
+        return overlay
+
+    colored_vis = colorize_instance_mask(label_matrix)
+    cell_mask = label_matrix > 0
+    overlay[cell_mask] = (
+        overlay[cell_mask].astype(np.float32) * 0.45
+        + colored_vis[cell_mask].astype(np.float32) * 0.55
+    ).astype(np.uint8)
+
+    for uid in range(1, num_cells + 1):
+        single_cell = (label_matrix == uid).astype(np.uint8)
+        contours, _ = cv2.findContours(single_cell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
+    return overlay
+
+
+def load_trained_model(
+    cfg: Dict[str, Any],
+    weights_path: Optional[str],
+    device: torch.device,
+) -> CellOneFormerModule:
+    """Loads CellOneFormerModule in eval mode from a raw state_dict or full training checkpoint."""
+    num_queries = cfg["model"]["num_queries"]
+    state_dict = None
+    if weights_path and os.path.exists(weights_path):
+        payload = torch.load(weights_path, map_location=device)
+        if isinstance(payload, dict) and "model_state_dict" in payload:
+            state_dict = payload["model_state_dict"]
+        else:
+            state_dict = payload
+        for k, v in state_dict.items():
+            if "query_embed.weight" in k and hasattr(v, "shape"):
+                num_queries = int(v.shape[0])
+                break
+
+    model_module = CellOneFormerModule(
+        pretrained_model_name=cfg["model"]["pretrained_model_name"],
+        num_classes=cfg["model"]["num_classes"],
+        num_queries=num_queries,
+        is_training=False,
+    )
+    if state_dict is not None:
+        model_module.load_state_dict(state_dict, strict=False)
+
+    model_module.to(device)
+    model_module.eval()
+    return model_module
+
+
 def infer_tiles_batched(
     tiles: list,
     model_module: CellOneFormerModule,
@@ -67,10 +137,11 @@ def infer_tiles_batched(
     batch_size: int,
     score_thresh: float,
     min_area: int,
+    max_area: Optional[int] = 8000,
 ) -> list:
-    """Runs batched GPU inference across overlapping tiles."""
+    """Runs batched GPU/CPU inference across overlapping tiles."""
     tile_results = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for start_idx in range(0, len(tiles), batch_size):
             batch_tiles = tiles[start_idx : start_idx + batch_size]
             pil_imgs = [Image.fromarray(t["image"]) for t in batch_tiles]
@@ -92,6 +163,7 @@ def infer_tiles_batched(
                 target_sizes=target_sizes,
                 threshold=score_thresh,
                 min_area=min_area,
+                max_area=max_area,
             )
 
             for b_idx, tile in enumerate(batch_tiles):
@@ -118,73 +190,47 @@ def infer_tiles_batched(
     return tile_results
 
 
-def main():
-    args = parse_args()
-
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    device = torch.device(args.device)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    percentile_norm = cfg["data"].get("percentile_norm", True)
-    apply_clahe = cfg["data"].get("apply_clahe", False)
-
-    print(f"[Inference] Loading image: {args.image}")
-    image = load_microscopy_image(args.image, percentile_norm=percentile_norm, apply_clahe=apply_clahe)
+def predict_full_image(
+    image: np.ndarray,
+    model_module: CellOneFormerModule,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    score_thresh: Optional[float] = None,
+    stitch_iou: Optional[float] = None,
+    min_area: Optional[int] = None,
+    max_area: Optional[int] = None,
+    tile_overlap: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    use_tta: Optional[bool] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Runs end-to-end tiled inference + optional TTA + Soft-IoU stitching on an RGB image.
+    Returns (label_matrix, kept_masks).
+    """
     orig_h, orig_w = image.shape[:2]
+    tile_size = int(cfg["inference"].get("tile_size", 512))
+    overlap = int(tile_overlap if tile_overlap is not None else cfg["inference"].get("tile_overlap", 64))
+    bs = int(batch_size or cfg["inference"].get("batch_size", 4))
+    s_th = float(score_thresh if score_thresh is not None else cfg["inference"].get("score_threshold", 0.25))
+    min_a = int(min_area if min_area is not None else cfg["data"].get("min_cell_area", 15))
+    max_a = int(max_area if max_area is not None else cfg["data"].get("max_cell_area", 8000))
+    st_iou = float(stitch_iou if stitch_iou is not None else cfg["inference"].get("iou_threshold_stitch", 0.5))
+    gaussian_seam = bool(cfg["inference"].get("gaussian_seam_weighting", True))
+    tta = bool(use_tta if use_tta is not None else cfg["inference"].get("tta", False))
 
-    # Auto-detect num_queries from checkpoint if weights are provided
-    num_queries = cfg["model"]["num_queries"]
-    state_dict = None
-    if args.weights and os.path.exists(args.weights):
-        print(f"[Inference] Loading trained weights from {args.weights}...")
-        state_dict = torch.load(args.weights, map_location=device)
-        for k, v in state_dict.items():
-            if "query_embed.weight" in k and hasattr(v, "shape"):
-                num_queries = int(v.shape[0])
-                break
-
-    # Initialize model
-    model_module = CellOneFormerModule(
-        pretrained_model_name=cfg["model"]["pretrained_model_name"],
-        num_classes=cfg["model"]["num_classes"],
-        num_queries=num_queries,
-    )
-
-    if state_dict is not None:
-        model_module.load_state_dict(state_dict, strict=False)
-    else:
-        print("[Inference] No weights provided; running zero-shot with base weights.")
-
-    model_module.to(device)
-    model_module.eval()
-
-    # Slice image into tiles
-    tiler = SlidingWindowTiler(
-        tile_size=cfg["inference"]["tile_size"],
-        tile_overlap=cfg["inference"]["tile_overlap"],
-    )
+    tiler = SlidingWindowTiler(tile_size=tile_size, tile_overlap=overlap, min_cell_area=min_a)
     tiles = tiler.tile_image_and_mask(image)
-    batch_size = args.batch_size or cfg["inference"].get("batch_size", 4)
-    score_thresh = args.score_threshold if args.score_threshold is not None else cfg["inference"]["score_threshold"]
-    min_area = args.min_area if args.min_area is not None else cfg["data"]["min_cell_area"]
-    use_tta = args.tta or cfg["inference"].get("tta", False)
-
-    print(f"[Inference] Sliced {orig_h}x{orig_w} image into {len(tiles)} overlapping tiles (batch_size={batch_size}, TTA={use_tta}).")
 
     task_name = cfg["model"].get("task", "instance").lower()
     task_key = "instance" if "instance" in task_name else ("semantic" if "semantic" in task_name else "panoptic")
 
-    tile_results = infer_tiles_batched(tiles, model_module, device, task_key, batch_size, score_thresh, min_area)
+    tile_results = infer_tiles_batched(tiles, model_module, device, task_key, bs, s_th, min_a, max_a)
 
-    # Optional Test-Time Augmentation (Horizontal & Vertical Flips)
-    if use_tta:
+    if tta:
         for flip_mode in ("hflip", "vflip"):
             flipped_img = np.fliplr(image).copy() if flip_mode == "hflip" else np.flipud(image).copy()
             f_tiles = tiler.tile_image_and_mask(flipped_img)
-            f_results = infer_tiles_batched(f_tiles, model_module, device, task_key, batch_size, score_thresh, min_area)
+            f_results = infer_tiles_batched(f_tiles, model_module, device, task_key, bs, s_th, min_a, max_a)
             for res in f_results:
                 y1, y2, x1, x2 = res["coords"]
                 vh, vw = min(orig_h, y2) - y1, min(orig_w, x2) - x1
@@ -202,46 +248,74 @@ def main():
                     "coords": inv_coords,
                 })
 
-    # Stitch predictions
-    stitch_iou = args.stitch_iou if args.stitch_iou is not None else cfg["inference"]["iou_threshold_stitch"]
-    max_area = cfg["data"].get("max_cell_area", 8000)
-    gaussian_seam = cfg["inference"].get("gaussian_seam_weighting", True)
     stitcher = TileStitcher(
-        iou_threshold=stitch_iou,
-        min_area=min_area,
-        max_area=max_area,
+        iou_threshold=st_iou,
+        min_area=min_a,
+        max_area=max_a,
         gaussian_seam_weighting=gaussian_seam,
     )
-    label_matrix, kept_masks = stitcher.stitch_tile_predictions(orig_h, orig_w, tile_results)
+    return stitcher.stitch_tile_predictions(orig_h, orig_w, tile_results)
+
+
+def main():
+    args = parse_args()
+
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device(args.device)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    percentile_norm = cfg["data"].get("percentile_norm", True)
+    apply_clahe = cfg["data"].get("apply_clahe", False)
+
+    print(f"[Inference] Loading image: {args.image}")
+    image = load_microscopy_image(args.image, percentile_norm=percentile_norm, apply_clahe=apply_clahe)
+
+    if args.weights and os.path.exists(args.weights):
+        print(f"[Inference] Loading trained weights from {args.weights}...")
+    else:
+        print("[Inference] No weights provided; running zero-shot with base weights.")
+
+    model_module = load_trained_model(cfg, args.weights, device)
+
+    label_matrix, kept_masks = predict_full_image(
+        image=image,
+        model_module=model_module,
+        cfg=cfg,
+        device=device,
+        score_thresh=args.score_threshold,
+        stitch_iou=args.stitch_iou,
+        min_area=args.min_area,
+        max_area=args.max_area,
+        tile_overlap=args.tile_overlap,
+        batch_size=args.batch_size,
+        use_tta=args.tta if args.tta else None,
+    )
 
     num_detected_cells = int(label_matrix.max())
     print(f"[Inference] Stitched predictions: detected {num_detected_cells} individual cells.")
 
-    # Save output label mask as uint16 to preserve >255 cell IDs
     stem = Path(args.image).stem
     out_mask_path = output_dir / f"{stem}_pred_mask.png"
     cv2.imwrite(str(out_mask_path), label_matrix.astype(np.uint16))
 
-    # Save visual overlay with crisp contours and untouched background
-    colored_vis = colorize_instance_mask(label_matrix)
-    overlay = image.copy()
-    if overlay.ndim == 2:
-        overlay = np.stack([overlay] * 3, axis=-1)
-    if num_detected_cells > 0:
-        cell_mask = (label_matrix > 0)
-        overlay[cell_mask] = (overlay[cell_mask].astype(float) * 0.45 + colored_vis[cell_mask].astype(float) * 0.55).astype(np.uint8)
-        for uid in range(1, num_detected_cells + 1):
-            single_cell = (label_matrix == uid).astype(np.uint8)
-            contours, _ = cv2.findContours(single_cell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
-
+    overlay = create_overlay(image, label_matrix)
     out_vis_path = output_dir / f"{stem}_overlay.png"
     cv2.imwrite(str(out_vis_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     print(f"[Inference] Saved label mask to: {out_mask_path}")
     print(f"[Inference] Saved overlay to:    {out_vis_path}")
 
-    # Evaluate against ground truth if supplied
+    if args.morphometry:
+        rows = extract_cell_morphometry(label_matrix, image=image, pixel_size_um=args.pixel_size_um)
+        out_csv_path = output_dir / f"{stem}_cells.csv"
+        save_morphometry_csv(rows, str(out_csv_path))
+        summary = summarize_morphometry(rows, image.shape)
+        print(f"[Morphometry] Saved {len(rows)} cells to: {out_csv_path}")
+        print(f"[Morphometry] Confluence: {summary['confluence_pct']}% | Mean area: {summary['mean_area_px']} px | Mean circularity: {summary['mean_circularity']}")
+
     if args.mask and os.path.exists(args.mask):
         gt_mask = load_instance_mask(args.mask)
         gt_ids = np.unique(gt_mask)

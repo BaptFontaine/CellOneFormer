@@ -37,7 +37,8 @@ def get_microscopy_augmentations(is_train: bool = True, image_size: int = 512) -
             ),
             A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.5),
             A.RandomGamma(gamma_limit=(80, 120), p=0.3),
-            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.15, hue=0.05, p=0.3),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.15),
+            A.ColorJitter(brightness=0.1, contrast=0.15, saturation=0.2, hue=0.08, p=0.3),
             A.GaussNoise(p=0.25),
         ])
     return A.Compose([])
@@ -63,6 +64,38 @@ class CellOneFormerDataset(Dataset):
         self.task = task
         self.is_train = is_train
         self.transforms = get_microscopy_augmentations(is_train=is_train)
+
+        task_name = self.task.lower().strip()
+        if "instance" in task_name:
+            self.task_key = "instance"
+        elif "semantic" in task_name:
+            self.task_key = "semantic"
+        else:
+            self.task_key = "panoptic"
+
+        # Pre-cache processor constants and tokenized task prompt once to avoid per-sample CPU overhead
+        self._cached_task_inputs = None
+        self._img_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self._img_std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        self._rescale_factor = 1.0 / 255.0
+        if self.processor is not None:
+            ip = getattr(self.processor, "image_processor", None)
+            if ip is not None:
+                if getattr(ip, "image_mean", None) is not None:
+                    self._img_mean = np.array(ip.image_mean, dtype=np.float32).reshape(1, 1, 3)
+                if getattr(ip, "image_std", None) is not None:
+                    self._img_std = np.array(ip.image_std, dtype=np.float32).reshape(1, 1, 3)
+                if getattr(ip, "rescale_factor", None) is not None:
+                    self._rescale_factor = float(ip.rescale_factor)
+            tok = getattr(self.processor, "tokenizer", None)
+            if tok is not None:
+                task_seq_len = getattr(self.processor, "task_seq_len", 77)
+                self._cached_task_inputs = tok(
+                    [f"the task is {self.task_key}"],
+                    padding="max_length",
+                    max_length=task_seq_len,
+                    return_tensors="pt",
+                )["input_ids"].squeeze(0)
 
         # Collect image files
         extensions = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff")
@@ -128,38 +161,26 @@ class CellOneFormerDataset(Dataset):
             augmented = self.transforms(image=image)
             image = augmented["image"]
 
-        # Ensure image is PIL Image with 3 channels
+        # Ensure image has 3 channels
         if image.ndim == 2:
             image = np.stack([image] * 3, axis=-1)
-        pil_image = Image.fromarray(image.astype(np.uint8))
 
-        # Hugging Face OneFormerProcessor strictly expects "instance", "semantic", or "panoptic"
-        task_name = self.task.lower().strip()
-        if "instance" in task_name:
-            task_key = "instance"
-        elif "semantic" in task_name:
-            task_key = "semantic"
-        else:
-            task_key = "panoptic"
+        task_key = self.task_key
 
-        # If processor is available, preprocess image and build exact instance mask_labels/class_labels directly
+        # Fast tensor preprocessing using pre-cached ImageProcessor constants and task tokens
         if self.processor is not None:
-            inputs = self.processor(
-                images=pil_image,
-                task_inputs=[task_key],
-                return_tensors="pt",
-            )
-            item = {}
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    item[k] = v.squeeze(0)
-                elif isinstance(v, list) and len(v) > 0:
-                    item[k] = v[0]
-                else:
-                    item[k] = v
+            pixel_values_np = (image.astype(np.float32) * self._rescale_factor - self._img_mean) / self._img_std
+            pixel_values = torch.from_numpy(np.ascontiguousarray(pixel_values_np.transpose(2, 0, 1)))
+            _, h_pv, w_pv = pixel_values.shape
+
+            item = {
+                "pixel_values": pixel_values,
+                "pixel_mask": torch.ones((h_pv, w_pv), dtype=torch.long),
+            }
+            if self._cached_task_inputs is not None:
+                item["task_inputs"] = self._cached_task_inputs.clone()
 
             if mask is not None:
-                _, h_pv, w_pv = item["pixel_values"].shape
                 if mask.shape[0] != h_pv or mask.shape[1] != w_pv:
                     mask_resized = cv2.resize(
                         mask.astype(np.uint16),
@@ -169,7 +190,8 @@ class CellOneFormerDataset(Dataset):
                 else:
                     mask_resized = mask
 
-                instance_ids = [int(uid) for uid in np.unique(mask_resized) if uid > 0]
+                unique_ids = np.unique(mask_resized)
+                instance_ids = unique_ids[unique_ids > 0]
                 if len(instance_ids) == 0 and self.is_train:
                     # Fallback single small instance only if tile is completely empty
                     fallback = np.zeros((h_pv, w_pv), dtype=np.float32)
@@ -177,10 +199,7 @@ class CellOneFormerDataset(Dataset):
                     item["mask_labels"] = torch.from_numpy(fallback).unsqueeze(0)
                     item["class_labels"] = torch.ones(1, dtype=torch.long)
                 elif len(instance_ids) > 0:
-                    bin_masks = np.stack(
-                        [(mask_resized == uid).astype(np.float32) for uid in instance_ids],
-                        axis=0,
-                    )
+                    bin_masks = (mask_resized[None, :, :] == instance_ids[:, None, None]).astype(np.float32)
                     item["mask_labels"] = torch.from_numpy(bin_masks)
                     item["class_labels"] = torch.ones(len(instance_ids), dtype=torch.long)
 

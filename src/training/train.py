@@ -49,8 +49,11 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Override gradient accumulation steps")
-    parser.add_argument("--mixed-precision", type=str, default=None, help="Override mixed precision (no, fp16, bf16)")
+    parser.add_argument("--mixed-precision", type=str, default=None, help="Override mixed precision (no, fp16, bf16, auto)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--eval-every", type=int, default=None, help="Run validation every N epochs")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="Optional cap on raw training images before tiling")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     return parser.parse_args()
 
@@ -263,26 +266,27 @@ def validate_epoch_f1(
     val_loader: DataLoader,
     device: torch.device,
     score_thresh: float = 0.2,
+    max_area: int = 8000,
     max_batches: int = 25,
 ) -> float:
     """Computes mean F1@0.5 score on validation tiles."""
     model_module.eval()
     f1_scores = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for b_idx, batch in enumerate(val_loader):
             if b_idx >= max_batches:
                 break
             if "mask_labels" not in batch or not batch["mask_labels"]:
                 continue
 
-            pixel_values = batch["pixel_values"].to(device)
+            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             task_inputs = batch.get("task_inputs")
             if task_inputs is not None:
-                task_inputs = task_inputs.to(device)
+                task_inputs = task_inputs.to(device, non_blocking=True)
             pixel_mask = batch.get("pixel_mask")
             if pixel_mask is not None:
-                pixel_mask = pixel_mask.to(device)
+                pixel_mask = pixel_mask.to(device, non_blocking=True)
 
             outputs = model_module(
                 pixel_values=pixel_values,
@@ -296,6 +300,7 @@ def validate_epoch_f1(
                 outputs,
                 target_sizes=target_sizes,
                 threshold=score_thresh,
+                max_area=max_area,
             )
 
             for i, pred_dict in enumerate(preds):
@@ -318,6 +323,11 @@ def main():
     lr = args.lr or cfg["training"]["learning_rate"]
     backbone_lr = cfg["training"].get("backbone_learning_rate", lr * 0.1)
     device = torch.device(args.device)
+    if args.max_train_samples is not None:
+        cfg["data"]["max_train_samples"] = args.max_train_samples
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     print("=" * 60)
     print(" Multi-Modality Cell Segmentation with OneFormer")
@@ -356,13 +366,18 @@ def main():
     val_img_dir = str(Path(cfg["data"]["processed_dir"]) / "val" / "images")
     val_msk_dir = str(Path(cfg["data"]["processed_dir"]) / "val" / "masks")
 
-    # Auto-detect num_queries from checkpoint when resuming
+    # Auto-detect num_queries and optional full training state from checkpoint when resuming
     num_queries = cfg["model"]["num_queries"]
-    resume_state = None
+    resume_payload = None
+    resume_model_state = None
     if args.resume and os.path.exists(args.resume):
         print(f"[Training] Resuming from existing checkpoint: {args.resume}")
-        resume_state = torch.load(args.resume, map_location=device)
-        for k, v in resume_state.items():
+        resume_payload = torch.load(args.resume, map_location=device)
+        if isinstance(resume_payload, dict) and "model_state_dict" in resume_payload:
+            resume_model_state = resume_payload["model_state_dict"]
+        else:
+            resume_model_state = resume_payload
+        for k, v in resume_model_state.items():
             if "query_embed.weight" in k and hasattr(v, "shape"):
                 num_queries = int(v.shape[0])
                 break
@@ -374,8 +389,8 @@ def main():
         num_queries=num_queries,
         is_training=True,
     )
-    if resume_state is not None:
-        model_module.load_state_dict(resume_state, strict=False)
+    if resume_model_state is not None:
+        model_module.load_state_dict(resume_model_state, strict=False)
     model_module.to(device)
 
     # Training & Validation Datasets
@@ -387,12 +402,22 @@ def main():
         is_train=True,
     )
 
+    num_workers = args.num_workers if args.num_workers is not None else min(4, os.cpu_count() or 2)
+    pin_mem = device.type == "cuda"
+    loader_kwargs = {
+        "collate_fn": collate_fn_oneformer,
+        "num_workers": num_workers,
+        "pin_memory": pin_mem,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=collate_fn_oneformer,
-        num_workers=2,
+        **loader_kwargs,
     )
 
     val_loader = None
@@ -409,8 +434,7 @@ def main():
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                collate_fn=collate_fn_oneformer,
-                num_workers=2,
+                **loader_kwargs,
             )
         except Exception:
             val_loader = None
@@ -441,45 +465,100 @@ def main():
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
 
-    mp_mode = args.mixed_precision or cfg["training"]["mixed_precision"]
+    mp_mode = (args.mixed_precision or cfg["training"]["mixed_precision"]).lower()
+    if mp_mode == "auto":
+        if device.type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            mp_mode = "bf16"
+        else:
+            mp_mode = "no"
     use_amp = (mp_mode in ("fp16", "bf16")) and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if mp_mode == "bf16" else torch.float16
+    scaler_enabled = (mp_mode == "fp16") and device.type == "cuda"
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     except (TypeError, AttributeError):
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
     output_dir = Path(cfg["training"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     grad_accum_steps = args.gradient_accumulation_steps or max(1, int(cfg["training"].get("gradient_accumulation_steps", 1)))
-    eval_every = max(1, int(cfg["training"].get("eval_every_epochs", 1)))
-    print(f"\n[Training] Starting remote training for {epochs} epochs on {device} (batch_size={batch_size}, grad_accum={grad_accum_steps}, backbone_lr={backbone_lr}, decoder_lr={lr})...")
+    eval_every = args.eval_every or max(1, int(cfg["training"].get("eval_every_epochs", 1)))
+    max_cell_area = int(cfg["data"].get("max_cell_area", 8000))
+    patience = int(cfg["training"].get("early_stopping_patience", 10))
+
+    start_epoch = 1
     best_loss = float("inf")
     best_f1 = -1.0
+    if isinstance(resume_payload, dict) and "model_state_dict" in resume_payload:
+        if "optimizer_state_dict" in resume_payload:
+            try:
+                optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+            except Exception as exc:
+                print(f"[Warning] Could not restore optimizer state: {exc}")
+        if "scheduler_state_dict" in resume_payload:
+            try:
+                scheduler.load_state_dict(resume_payload["scheduler_state_dict"])
+            except Exception as exc:
+                print(f"[Warning] Could not restore scheduler state: {exc}")
+        if scaler_enabled and "scaler_state_dict" in resume_payload:
+            try:
+                scaler.load_state_dict(resume_payload["scaler_state_dict"])
+            except Exception:
+                pass
+        best_f1 = float(resume_payload.get("best_f1", -1.0))
+        best_loss = float(resume_payload.get("best_loss", float("inf")))
+        start_epoch = int(resume_payload.get("epoch", 0)) + 1
+        if start_epoch > epochs:
+            start_epoch = 1
+    elif resume_model_state is not None and val_loader is not None:
+        # Measure baseline F1 so resuming from raw weights never overwrites a stronger checkpoint
+        best_f1 = validate_epoch_f1(
+            model_module,
+            val_loader,
+            device,
+            score_thresh=cfg["inference"].get("score_threshold", 0.2),
+            max_area=max_cell_area,
+        )
+        print(f"[Training] Baseline Val F1@0.5 of resumed weights: {best_f1:.4f}")
 
-    for epoch in range(1, epochs + 1):
+    print(
+        f"\n[Training] Starting training epochs {start_epoch}->{epochs} on {device} "
+        f"(batch_size={batch_size}, grad_accum={grad_accum_steps}, amp={mp_mode}, "
+        f"workers={num_workers}, eval_every={eval_every}, backbone_lr={backbone_lr}, decoder_lr={lr})..."
+    )
+
+    epochs_no_improve = 0
+    nan_batches = 0
+
+    for epoch in range(start_epoch, epochs + 1):
         model_module.train()
         epoch_loss = 0.0
-        optimizer.zero_grad()
+        valid_steps = 0
+        optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
         for step, batch in enumerate(pbar):
             if not batch or "pixel_values" not in batch or "mask_labels" not in batch or not batch["mask_labels"]:
                 continue
-            pixel_values = batch["pixel_values"].to(device)
+            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             text_inputs = batch.get("text_inputs")
             if text_inputs is not None:
-                text_inputs = text_inputs.to(device)
+                text_inputs = text_inputs.to(device, non_blocking=True)
             task_inputs = batch.get("task_inputs")
             if task_inputs is not None:
-                task_inputs = task_inputs.to(device)
+                task_inputs = task_inputs.to(device, non_blocking=True)
             pixel_mask = batch.get("pixel_mask")
             if pixel_mask is not None:
-                pixel_mask = pixel_mask.to(device)
-            mask_labels = [m.to(device) for m in batch["mask_labels"]]
-            class_labels = [c.to(device) for c in batch["class_labels"]]
+                pixel_mask = pixel_mask.to(device, non_blocking=True)
+            mask_labels = [m.to(device, non_blocking=True) for m in batch["mask_labels"]]
+            class_labels = [c.to(device, non_blocking=True) for c in batch["class_labels"]]
 
-            autocast_ctx = torch.amp.autocast("cuda", enabled=use_amp) if hasattr(torch.amp, "autocast") else torch.cuda.amp.autocast(enabled=use_amp)
+            autocast_ctx = (
+                torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
+                if hasattr(torch.amp, "autocast")
+                else torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp)
+            )
             with autocast_ctx:
                 outputs = model_module(
                     pixel_values=pixel_values,
@@ -493,47 +572,55 @@ def main():
                 loss_scaled = loss / grad_accum_steps
 
             if not torch.isfinite(loss):
-                optimizer.zero_grad()
+                nan_batches += 1
+                if nan_batches <= 5 or nan_batches % 25 == 0:
+                    print(f"\n[Warning] Non-finite loss encountered ({nan_batches} total). Consider --mixed-precision bf16 or no.")
                 continue
 
             scaler.scale(loss_scaled).backward()
+            valid_steps += 1
+            epoch_loss += float(loss.item())
 
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
+                if scaler_enabled:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model_module.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-            epoch_loss += float(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        avg_loss = epoch_loss / max(1, len(train_loader))
+        avg_loss = epoch_loss / max(1, valid_steps)
         scheduler.step()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
         val_f1_str = ""
         val_f1 = -1.0
+        evaluated = False
         if val_loader is not None and (epoch % eval_every == 0 or epoch == epochs):
             val_f1 = validate_epoch_f1(
                 model_module,
                 val_loader,
                 device,
                 score_thresh=cfg["inference"].get("score_threshold", 0.2),
+                max_area=max_cell_area,
             )
             val_f1_str = f" | Val F1@0.5: {val_f1:.4f}"
+            evaluated = True
 
         print(f"[Epoch {epoch}/{epochs}] Average Loss: {avg_loss:.4f}{val_f1_str} | Decoder LR: {optimizer.param_groups[-1]['lr']:.6f}")
 
         # Save checkpoint if F1 improved or training loss improved
-        is_better = (val_f1 > best_f1) if val_f1 >= 0 else (avg_loss < best_loss)
+        is_better = (val_f1 > best_f1) if evaluated else (avg_loss < best_loss)
         if avg_loss < best_loss:
             best_loss = avg_loss
         if val_f1 > best_f1:
             best_f1 = val_f1
 
         if is_better:
+            epochs_no_improve = 0
             save_path = output_dir / "oneformer_cells_best.pt"
             torch.save(model_module.state_dict(), save_path)
             print(f"[*] Best checkpoint saved to {save_path} (loss: {avg_loss:.4f}{val_f1_str})")
@@ -544,6 +631,25 @@ def main():
                 drive_backup_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(model_module.state_dict(), drive_backup_dir / "oneformer_real_cells_best.pt")
                 print(f"[*] Checkpoint automatically backed up to Google Drive: {drive_backup_dir / 'oneformer_real_cells_best.pt'}")
+        elif evaluated or val_loader is None:
+            epochs_no_improve += 1
+
+        # Always save resumable full training state
+        full_state = {
+            "epoch": epoch,
+            "model_state_dict": model_module.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_f1": best_f1,
+            "best_loss": best_loss,
+        }
+        if scaler_enabled:
+            full_state["scaler_state_dict"] = scaler.state_dict()
+        torch.save(full_state, output_dir / "oneformer_cells_last_state.pt")
+
+        if patience > 0 and epochs_no_improve >= patience:
+            print(f"[Training] Early stopping triggered after {patience} evaluations without improvement.")
+            break
 
     print("[Training] Remote training finished successfully.")
 
