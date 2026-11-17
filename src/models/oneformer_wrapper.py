@@ -162,9 +162,11 @@ class CellOneFormerModule(nn.Module):
         mask_threshold: float = 0.5,
         min_area: int = 15,
         max_area: Optional[int] = 8000,
+        return_crops: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Direct transformer query decoding into binary instance masks.
+        Direct transformer query decoding into binary instance masks (or tight bbox crops
+        when return_crops=True to avoid per-tile full-frame allocations).
         Uses Mask2Former/OneFormer mask-confidence weighting (cls_score * mask_ness),
         connected-component splitting, and border-strip / solidity filtering.
         """
@@ -240,17 +242,22 @@ class CellOneFormerModule(nn.Module):
                     if touches_border and aspect > 4.5 and comp_area > 300:
                         continue
 
-                    comp_mask = (labels == comp_id)
+                    crop_mask = (labels[by : by + bh, bx : bx + bw] == comp_id)
                     # Check solidity (area / convex hull area) for large sprawling blobs
                     if comp_area > 250:
-                        cnts, _ = cv2.findContours(comp_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cnts, _ = cv2.findContours(crop_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         if cnts:
                             hull_area = cv2.contourArea(cv2.convexHull(cnts[0]))
                             solidity = comp_area / max(1.0, hull_area)
                             if solidity < 0.42:
                                 continue
 
-                    masks_list.append(comp_mask)
+                    if return_crops:
+                        masks_list.append((by, by + bh, bx, bx + bw, crop_mask))
+                    else:
+                        full_comp = np.zeros((target_h, target_w), dtype=bool)
+                        full_comp[by : by + bh, bx : bx + bw] = crop_mask
+                        masks_list.append(full_comp)
                     scores_list.append(combined_score)
 
             results.append({

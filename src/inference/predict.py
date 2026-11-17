@@ -85,14 +85,17 @@ def create_overlay(image: np.ndarray, label_matrix: np.ndarray) -> np.ndarray:
     colored_vis = colorize_instance_mask(label_matrix)
     cell_mask = label_matrix > 0
     overlay[cell_mask] = (
-        overlay[cell_mask].astype(np.float32) * 0.45
-        + colored_vis[cell_mask].astype(np.float32) * 0.55
+        (overlay[cell_mask].astype(np.uint16) * 45 + colored_vis[cell_mask].astype(np.uint16) * 55) // 100
     ).astype(np.uint8)
 
-    for uid in range(1, num_cells + 1):
-        single_cell = (label_matrix == uid).astype(np.uint8)
-        contours, _ = cv2.findContours(single_cell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (255, 255, 255), 1)
+    # Vectorized O(1) cell boundary rendering (avoids O(num_cells) full-image findContours loops)
+    border = np.zeros(label_matrix.shape, dtype=bool)
+    border[1:, :] |= label_matrix[1:, :] != label_matrix[:-1, :]
+    border[:-1, :] |= label_matrix[:-1, :] != label_matrix[1:, :]
+    border[:, 1:] |= label_matrix[:, 1:] != label_matrix[:, :-1]
+    border[:, :-1] |= label_matrix[:, :-1] != label_matrix[:, 1:]
+    border &= cell_mask
+    overlay[border] = (255, 255, 255)
     return overlay
 
 
@@ -138,6 +141,7 @@ def infer_tiles_batched(
     score_thresh: float,
     min_area: int,
     max_area: Optional[int] = 8000,
+    return_crops: bool = False,
 ) -> list:
     """Runs batched GPU/CPU inference across overlapping tiles."""
     tile_results = []
@@ -164,6 +168,7 @@ def infer_tiles_batched(
                 threshold=score_thresh,
                 min_area=min_area,
                 max_area=max_area,
+                return_crops=return_crops,
             )
 
             for b_idx, tile in enumerate(batch_tiles):
@@ -225,27 +230,46 @@ def predict_full_image(
     task_name = cfg["model"].get("task", "instance").lower()
     task_key = "instance" if "instance" in task_name else ("semantic" if "semantic" in task_name else "panoptic")
 
-    tile_results = infer_tiles_batched(tiles, model_module, device, task_key, bs, s_th, min_a, max_a)
+    tile_results = infer_tiles_batched(
+        tiles, model_module, device, task_key, bs, s_th, min_a, max_a, return_crops=True
+    )
 
     if tta:
         for flip_mode in ("hflip", "vflip"):
             flipped_img = np.fliplr(image).copy() if flip_mode == "hflip" else np.flipud(image).copy()
             f_tiles = tiler.tile_image_and_mask(flipped_img)
-            f_results = infer_tiles_batched(f_tiles, model_module, device, task_key, bs, s_th, min_a, max_a)
+            f_results = infer_tiles_batched(
+                f_tiles, model_module, device, task_key, bs, s_th, min_a, max_a, return_crops=True
+            )
             for res in f_results:
                 y1, y2, x1, x2 = res["coords"]
                 vh, vw = min(orig_h, y2) - y1, min(orig_w, x2) - x1
                 if vh <= 0 or vw <= 0:
                     continue
+                inv_masks = []
+                inv_scores = []
+                for m, sc in zip(res["masks"], res["scores"]):
+                    if isinstance(m, tuple) and len(m) == 5:
+                        ly1, ly2, lx1, lx2, crop = m
+                        cy1, cy2 = max(0, ly1), min(vh, ly2)
+                        cx1, cx2 = max(0, lx1), min(vw, lx2)
+                        if cy2 <= cy1 or cx2 <= cx1:
+                            continue
+                        sub = crop[cy1 - ly1 : cy2 - ly1, cx1 - lx1 : cx2 - lx1]
+                        if flip_mode == "hflip":
+                            inv_masks.append((cy1, cy2, vw - cx2, vw - cx1, np.fliplr(sub)))
+                        else:
+                            inv_masks.append((vh - cy2, vh - cy1, cx1, cx2, np.flipud(sub)))
+                    else:
+                        inv_masks.append(np.fliplr(m[:vh, :vw]) if flip_mode == "hflip" else np.flipud(m[:vh, :vw]))
+                    inv_scores.append(sc * 0.95)
                 if flip_mode == "hflip":
                     inv_coords = (y1, y1 + vh, orig_w - (x1 + vw), orig_w - x1)
-                    inv_masks = [np.fliplr(m[:vh, :vw]) for m in res["masks"]]
                 else:
                     inv_coords = (orig_h - (y1 + vh), orig_h - y1, x1, x1 + vw)
-                    inv_masks = [np.flipud(m[:vh, :vw]) for m in res["masks"]]
                 tile_results.append({
                     "masks": inv_masks,
-                    "scores": [s * 0.95 for s in res["scores"]],
+                    "scores": inv_scores,
                     "coords": inv_coords,
                 })
 

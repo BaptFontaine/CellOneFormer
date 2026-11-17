@@ -4,6 +4,7 @@ Reconstructs full-field microscopy images from overlapping tile predictions
 using soft-IoU suppression across seams.
 """
 
+from collections import defaultdict
 import numpy as np
 import cv2
 from typing import Dict, List, Tuple, Optional
@@ -85,31 +86,53 @@ class TileStitcher:
             for idx, mask in enumerate(masks):
                 score = float(scores[idx]) if len(scores) > idx else 1.0
 
-                # Ensure mask is exactly target_h x target_w (handles any resolution difference)
-                if mask.shape[0] != target_h or mask.shape[1] != target_w:
-                    mask = cv2.resize(
-                        mask.astype(np.uint8),
-                        (target_w, target_h),
-                        interpolation=cv2.INTER_NEAREST,
-                    ).astype(bool)
+                if isinstance(mask, tuple) and len(mask) == 5:
+                    c_y1, c_y2, c_x1, c_x2, c_crop = mask
+                    cy1, cy2 = max(0, int(c_y1)), min(valid_h, int(c_y2))
+                    cx1, cx2 = max(0, int(c_x1)), min(valid_w, int(c_x2))
+                    if cy2 <= cy1 or cx2 <= cx1:
+                        continue
+                    sub_crop = c_crop[cy1 - c_y1 : cy2 - c_y1, cx1 - c_x1 : cx2 - c_x1]
+                    ys_rel, xs_rel = np.nonzero(sub_crop)
+                    mask_area = len(ys_rel)
+                    if mask_area < self.min_area or (self.max_area is not None and mask_area > self.max_area):
+                        continue
+                    ys = ys_rel + cy1
+                    xs = xs_rel + cx1
+                    if self.gaussian_seam_weighting:
+                        score *= self._compute_center_weight_from_coords(ys, xs, valid_h, valid_w)
+                    ty1, ty2 = int(ys.min()), int(ys.max()) + 1
+                    tx1, tx2 = int(xs.min()), int(xs.max()) + 1
+                    by1, by2 = ty1 + y1_v, ty2 + y1_v
+                    bx1, bx2 = tx1 + x1_v, tx2 + x1_v
+                    tight_crop = sub_crop[ty1 - cy1 : ty2 - cy1, tx1 - cx1 : tx2 - cx1].copy()
                 else:
-                    mask = mask.astype(bool, copy=False)
+                    # Ensure mask is exactly target_h x target_w (handles any resolution difference)
+                    if mask.shape[0] != target_h or mask.shape[1] != target_w:
+                        mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (target_w, target_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
+                    else:
+                        mask = mask.astype(bool, copy=False)
 
-                cropped_mask = mask[:valid_h, :valid_w]
-                ys, xs = np.nonzero(cropped_mask)
-                mask_area = len(ys)
-                if mask_area < self.min_area or (self.max_area is not None and mask_area > self.max_area):
-                    continue
+                    cropped_mask = mask[:valid_h, :valid_w]
+                    ys, xs = np.nonzero(cropped_mask)
+                    mask_area = len(ys)
+                    if mask_area < self.min_area or (self.max_area is not None and mask_area > self.max_area):
+                        continue
 
-                if self.gaussian_seam_weighting:
-                    score *= self._compute_center_weight_from_coords(ys, xs, valid_h, valid_w)
+                    if self.gaussian_seam_weighting:
+                        score *= self._compute_center_weight_from_coords(ys, xs, valid_h, valid_w)
 
-                ly1, ly2 = int(ys.min()), int(ys.max()) + 1
-                lx1, lx2 = int(xs.min()), int(xs.max()) + 1
-                by1, by2 = ly1 + y1_v, ly2 + y1_v
-                bx1, bx2 = lx1 + x1_v, lx2 + x1_v
+                    ly1, ly2 = int(ys.min()), int(ys.max()) + 1
+                    lx1, lx2 = int(xs.min()), int(xs.max()) + 1
+                    by1, by2 = ly1 + y1_v, ly2 + y1_v
+                    bx1, bx2 = lx1 + x1_v, lx2 + x1_v
+                    tight_crop = cropped_mask[ly1:ly2, lx1:lx2].copy()
 
-                all_crops.append(cropped_mask[ly1:ly2, lx1:lx2].copy())
+                all_crops.append(tight_crop)
                 all_bboxes.append((by1, by2, bx1, bx2))
                 all_areas.append(mask_area)
                 all_scores.append(score)
@@ -124,11 +147,18 @@ class TileStitcher:
         order = np.argsort(-all_scores_arr)
         keep_indices = []
 
-        # 3. Fast Bounding-Box + Soft-IoU suppression across tile seams (computed on tight bbox overlaps)
+        # 3. Spatial-grid Soft-IoU suppression across tile seams (O(N) instead of O(N^2))
+        bucket_size = 128
+        grid = defaultdict(list)
+        for pos, idx in enumerate(order):
+            by1, by2, bx1, bx2 = all_bboxes[idx]
+            for gy in range(by1 // bucket_size, (by2 - 1) // bucket_size + 1):
+                for gx in range(bx1 // bucket_size, (bx2 - 1) // bucket_size + 1):
+                    grid[(gy, gx)].append(pos)
+
         suppressed = np.zeros(len(order), dtype=bool)
 
-        for i in range(len(order)):
-            idx_i = order[i]
+        for pos_i, idx_i in enumerate(order):
             if suppressed[idx_i]:
                 continue
 
@@ -137,36 +167,38 @@ class TileStitcher:
             by1_i, by2_i, bx1_i, bx2_i = all_bboxes[idx_i]
             area_i = all_areas[idx_i]
 
-            for j in range(i + 1, len(order)):
-                idx_j = order[j]
-                if suppressed[idx_j]:
-                    continue
+            seen_pos = set()
+            for gy in range(by1_i // bucket_size, (by2_i - 1) // bucket_size + 1):
+                for gx in range(bx1_i // bucket_size, (bx2_i - 1) // bucket_size + 1):
+                    for pos_j in grid[(gy, gx)]:
+                        if pos_j <= pos_i or pos_j in seen_pos:
+                            continue
+                        seen_pos.add(pos_j)
+                        idx_j = order[pos_j]
+                        if suppressed[idx_j]:
+                            continue
 
-                by1_j, by2_j, bx1_j, bx2_j = all_bboxes[idx_j]
+                        by1_j, by2_j, bx1_j, bx2_j = all_bboxes[idx_j]
+                        if by2_i <= by1_j or by2_j <= by1_i or bx2_i <= bx1_j or bx2_j <= bx1_i:
+                            continue
 
-                # Fast bounding-box disjoint check
-                if by2_i <= by1_j or by2_j <= by1_i or bx2_i <= bx1_j or bx2_j <= bx1_i:
-                    continue
+                        iy1, iy2 = max(by1_i, by1_j), min(by2_i, by2_j)
+                        ix1, ix2 = max(bx1_i, bx1_j), min(bx2_i, bx2_j)
 
-                # Compute intersection only within overlapping bounding box
-                iy1, iy2 = max(by1_i, by1_j), min(by2_i, by2_j)
-                ix1, ix2 = max(bx1_i, bx1_j), min(bx2_i, bx2_j)
+                        crop_j = all_crops[idx_j]
+                        sub_i = crop_i[iy1 - by1_i : iy2 - by1_i, ix1 - bx1_i : ix2 - bx1_i]
+                        sub_j = crop_j[iy1 - by1_j : iy2 - by1_j, ix1 - bx1_j : ix2 - bx1_j]
+                        intersection = int(np.logical_and(sub_i, sub_j).sum())
+                        if intersection == 0:
+                            continue
 
-                crop_j = all_crops[idx_j]
-                sub_i = crop_i[iy1 - by1_i : iy2 - by1_i, ix1 - bx1_i : ix2 - bx1_i]
-                sub_j = crop_j[iy1 - by1_j : iy2 - by1_j, ix1 - bx1_j : ix2 - bx1_j]
-                intersection = int(np.logical_and(sub_i, sub_j).sum())
-                if intersection == 0:
-                    continue
+                        area_j = all_areas[idx_j]
+                        union = area_i + area_j - intersection
+                        iou = intersection / union if union > 0 else 0.0
+                        io_min = intersection / min(area_i, area_j) if min(area_i, area_j) > 0 else 0.0
 
-                area_j = all_areas[idx_j]
-                union = area_i + area_j - intersection
-                iou = intersection / union if union > 0 else 0.0
-                io_min = intersection / min(area_i, area_j) if min(area_i, area_j) > 0 else 0.0
-
-                # Suppress if IoU exceeds threshold OR one mask is mostly contained inside the other (nested duplicate)
-                if iou >= self.iou_threshold or io_min >= 0.65:
-                    suppressed[idx_j] = True
+                        if iou >= self.iou_threshold or io_min >= 0.65:
+                            suppressed[idx_j] = True
 
         # 4. Construct integer label matrix: highest-confidence masks claim pixels first (no overlap overwrite)
         label_matrix = np.zeros((full_height, full_width), dtype=np.int32)
