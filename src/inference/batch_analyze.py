@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.dataset.tiler import load_instance_mask, load_microscopy_image
 from src.inference.predict import create_overlay, load_trained_model, predict_full_image
 from src.training.train import find_image_mask_pairs
-from src.utils.metrics import compute_challenge_benchmark_metrics
+from src.utils.metrics import compute_challenge_benchmark_metrics_from_labels
 from src.utils.morphometry import (
     extract_cell_morphometry,
     save_morphometry_csv,
@@ -86,7 +86,7 @@ def main():
     summary_rows = []
     for img_path, mask_path in tqdm(pairs, desc="Analyzing images"):
         image = load_microscopy_image(str(img_path), percentile_norm=percentile_norm, apply_clahe=apply_clahe)
-        label_matrix, kept_masks = predict_full_image(
+        label_matrix, _ = predict_full_image(
             image=image,
             model_module=model_module,
             cfg=cfg,
@@ -96,6 +96,7 @@ def main():
             min_area=args.min_area,
             max_area=args.max_area,
             use_tta=args.tta if args.tta else None,
+            return_masks=False,
         )
 
         stem = img_path.stem
@@ -112,8 +113,7 @@ def main():
             gt_mask = load_instance_mask(str(mask_path))
             gt_ids = [gid for gid in np.unique(gt_mask) if gid > 0]
             if gt_ids:
-                gt_instances = np.array([gt_mask == gid for gid in gt_ids])
-                metrics = compute_challenge_benchmark_metrics(kept_masks, gt_instances)
+                metrics = compute_challenge_benchmark_metrics_from_labels(label_matrix, gt_mask)
                 summary["gt_count"] = len(gt_ids)
                 summary["F1_50"] = round(float(metrics["F1_50"]), 4)
                 summary["AP_50"] = round(float(metrics["AP_50"]), 4)

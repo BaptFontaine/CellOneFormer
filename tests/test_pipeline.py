@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 
 from src.dataset.tiler import SlidingWindowTiler
-from src.utils.metrics import compute_iou_matrix, evaluate_instances_at_threshold
+from src.utils.metrics import (
+    compute_challenge_benchmark_metrics,
+    compute_challenge_benchmark_metrics_from_labels,
+    compute_iou_matrix,
+    evaluate_instances_at_threshold,
+)
 from src.utils.morphometry import extract_cell_morphometry, summarize_morphometry
 from src.inference.stitcher import TileStitcher
 
@@ -77,3 +82,24 @@ def test_morphometry_extraction():
     summary = summarize_morphometry(rows, label_matrix.shape)
     assert summary["cell_count"] == 2
     assert np.isclose(summary["confluence_pct"], 6.0)
+
+
+def test_label_metrics_match_mask_metrics():
+    gt_label = np.zeros((100, 100), dtype=np.int32)
+    gt_label[10:30, 10:30] = 1
+    gt_label[50:70, 50:70] = 2
+
+    pred_label = np.zeros((100, 100), dtype=np.int32)
+    pred_label[10:30, 10:30] = 1
+    pred_label[52:70, 50:70] = 2
+
+    gt_masks = np.array([gt_label == 1, gt_label == 2], dtype=bool)
+    pred_masks = np.array([pred_label == 1, pred_label == 2], dtype=bool)
+
+    m_masks = compute_challenge_benchmark_metrics(pred_masks, gt_masks)
+    m_labels = compute_challenge_benchmark_metrics_from_labels(pred_label, gt_label)
+
+    assert np.isclose(m_masks["AP@50"], m_labels["AP@50"])
+    assert np.isclose(m_masks["AP@75"], m_labels["AP@75"])
+    assert np.isclose(m_masks["mAP@[50:95]"], m_labels["mAP@[50:95]"])
+    assert np.isclose(m_masks["F1"], m_labels["F1"])

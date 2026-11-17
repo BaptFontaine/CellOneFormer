@@ -25,7 +25,7 @@ from PIL import Image
 from src.dataset.tiler import SlidingWindowTiler, load_microscopy_image, load_instance_mask
 from src.inference.stitcher import TileStitcher
 from src.models.oneformer_wrapper import CellOneFormerModule
-from src.utils.metrics import compute_challenge_benchmark_metrics
+from src.utils.metrics import compute_challenge_benchmark_metrics, compute_challenge_benchmark_metrics_from_labels
 from src.utils.morphometry import (
     extract_cell_morphometry,
     save_morphometry_csv,
@@ -202,7 +202,8 @@ def predict_full_image(
     tile_overlap: Optional[int] = None,
     batch_size: Optional[int] = None,
     use_tta: Optional[bool] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_masks: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Runs end-to-end tiled inference + optional TTA + Soft-IoU stitching on an RGB image.
     Returns (label_matrix, kept_masks).
@@ -254,7 +255,7 @@ def predict_full_image(
         max_area=max_a,
         gaussian_seam_weighting=gaussian_seam,
     )
-    return stitcher.stitch_tile_predictions(orig_h, orig_w, tile_results)
+    return stitcher.stitch_tile_predictions(orig_h, orig_w, tile_results, return_masks=return_masks)
 
 
 def main():
@@ -280,7 +281,7 @@ def main():
 
     model_module = load_trained_model(cfg, args.weights, device)
 
-    label_matrix, kept_masks = predict_full_image(
+    label_matrix, _ = predict_full_image(
         image=image,
         model_module=model_module,
         cfg=cfg,
@@ -292,6 +293,7 @@ def main():
         tile_overlap=args.tile_overlap,
         batch_size=args.batch_size,
         use_tta=args.tta if args.tta else None,
+        return_masks=False,
     )
 
     num_detected_cells = int(label_matrix.max())
@@ -318,11 +320,8 @@ def main():
 
     if args.mask and os.path.exists(args.mask):
         gt_mask = load_instance_mask(args.mask)
-        gt_ids = np.unique(gt_mask)
-        gt_instances = [gt_mask == gid for gid in gt_ids if gid > 0]
-        if len(gt_instances) > 0:
-            gt_instances = np.array(gt_instances)
-            metrics = compute_challenge_benchmark_metrics(kept_masks, gt_instances)
+        if np.any(gt_mask > 0):
+            metrics = compute_challenge_benchmark_metrics_from_labels(label_matrix, gt_mask)
             print("\n" + "=" * 40)
             print(" Benchmark Evaluation Metrics")
             print("=" * 40)

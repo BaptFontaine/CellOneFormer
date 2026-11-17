@@ -28,12 +28,11 @@ class TileStitcher:
         self.gaussian_seam_weighting = gaussian_seam_weighting
 
     @staticmethod
-    def _compute_center_weight(mask: np.ndarray, tile_h: int, tile_w: int) -> float:
+    def _compute_center_weight_from_coords(ys: np.ndarray, xs: np.ndarray, tile_h: int, tile_w: int) -> float:
         """
         Computes a spatial confidence multiplier in [0.65, 1.0] that favors masks near the
         center of a tile over masks truncated at tile borders.
         """
-        ys, xs = np.nonzero(mask)
         if len(ys) == 0:
             return 0.65
         cy = float(np.mean(ys))
@@ -48,7 +47,8 @@ class TileStitcher:
         full_height: int,
         full_width: int,
         tile_results: List[Dict],
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        return_masks: bool = True,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Args:
             full_height: height of original microscopy image
@@ -57,16 +57,18 @@ class TileStitcher:
                 - 'masks': List of boolean 2D masks
                 - 'scores': List of float confidence scores
                 - 'coords': (y1, y2, x1, x2) in original image coordinates
+            return_masks: whether to materialize the (N_cells, H, W) boolean stack.
+                Set False for large whole-field images to avoid multi-GB RAM spikes.
         Returns:
             label_matrix: (full_height, full_width) int32 map where each cell has a unique integer ID >= 1
-            kept_masks: (N_cells, full_height, full_width) boolean array of deduplicated instances
+            kept_masks: (N_cells, full_height, full_width) boolean array, or None if return_masks=False
         """
-        all_global_masks = []
+        all_crops = []
         all_bboxes = []
         all_areas = []
         all_scores = []
 
-        # 1. Project local tile masks into global canvas
+        # 1. Store each candidate mask as a tight bounding-box crop (avoids N x H x W RAM explosion)
         for res in tile_results:
             y1, y2, x1, x2 = res["coords"]
             masks = res.get("masks", [])
@@ -91,39 +93,38 @@ class TileStitcher:
                         interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
                 else:
-                    mask = mask.astype(bool)
+                    mask = mask.astype(bool, copy=False)
 
                 cropped_mask = mask[:valid_h, :valid_w]
-                mask_area = int(np.sum(cropped_mask))
+                ys, xs = np.nonzero(cropped_mask)
+                mask_area = len(ys)
                 if mask_area < self.min_area or (self.max_area is not None and mask_area > self.max_area):
                     continue
 
                 if self.gaussian_seam_weighting:
-                    score *= self._compute_center_weight(cropped_mask, valid_h, valid_w)
+                    score *= self._compute_center_weight_from_coords(ys, xs, valid_h, valid_w)
 
-                ys, xs = np.nonzero(cropped_mask)
-                by1, by2 = int(ys.min()) + y1_v, int(ys.max()) + y1_v + 1
-                bx1, bx2 = int(xs.min()) + x1_v, int(xs.max()) + x1_v + 1
+                ly1, ly2 = int(ys.min()), int(ys.max()) + 1
+                lx1, lx2 = int(xs.min()), int(xs.max()) + 1
+                by1, by2 = ly1 + y1_v, ly2 + y1_v
+                bx1, bx2 = lx1 + x1_v, lx2 + x1_v
 
-                canvas = np.zeros((full_height, full_width), dtype=bool)
-                canvas[y1_v:y2_v, x1_v:x2_v] = cropped_mask
-
-                all_global_masks.append(canvas)
+                all_crops.append(cropped_mask[ly1:ly2, lx1:lx2].copy())
                 all_bboxes.append((by1, by2, bx1, bx2))
                 all_areas.append(mask_area)
                 all_scores.append(score)
 
-        if len(all_global_masks) == 0:
-            return np.zeros((full_height, full_width), dtype=np.int32), np.empty((0, full_height, full_width), dtype=bool)
+        if len(all_crops) == 0:
+            empty_masks = np.empty((0, full_height, full_width), dtype=bool) if return_masks else None
+            return np.zeros((full_height, full_width), dtype=np.int32), empty_masks
 
-        all_global_masks = np.array(all_global_masks)
-        all_scores = np.array(all_scores)
+        all_scores_arr = np.array(all_scores)
 
         # 2. Sort by confidence descending
-        order = np.argsort(-all_scores)
+        order = np.argsort(-all_scores_arr)
         keep_indices = []
 
-        # 3. Fast Bounding-Box + Soft-IoU suppression across tile seams
+        # 3. Fast Bounding-Box + Soft-IoU suppression across tile seams (computed on tight bbox overlaps)
         suppressed = np.zeros(len(order), dtype=bool)
 
         for i in range(len(order)):
@@ -132,7 +133,7 @@ class TileStitcher:
                 continue
 
             keep_indices.append(idx_i)
-            mask_i = all_global_masks[idx_i]
+            crop_i = all_crops[idx_i]
             by1_i, by2_i, bx1_i, bx2_i = all_bboxes[idx_i]
             area_i = all_areas[idx_i]
 
@@ -151,8 +152,10 @@ class TileStitcher:
                 iy1, iy2 = max(by1_i, by1_j), min(by2_i, by2_j)
                 ix1, ix2 = max(bx1_i, bx1_j), min(bx2_i, bx2_j)
 
-                mask_j = all_global_masks[idx_j]
-                intersection = int(np.logical_and(mask_i[iy1:iy2, ix1:ix2], mask_j[iy1:iy2, ix1:ix2]).sum())
+                crop_j = all_crops[idx_j]
+                sub_i = crop_i[iy1 - by1_i : iy2 - by1_i, ix1 - bx1_i : ix2 - bx1_i]
+                sub_j = crop_j[iy1 - by1_j : iy2 - by1_j, ix1 - bx1_j : ix2 - bx1_j]
+                intersection = int(np.logical_and(sub_i, sub_j).sum())
                 if intersection == 0:
                     continue
 
@@ -165,19 +168,28 @@ class TileStitcher:
                 if iou >= self.iou_threshold or io_min >= 0.65:
                     suppressed[idx_j] = True
 
-        kept_masks = all_global_masks[keep_indices]
-
         # 4. Construct integer label matrix: highest-confidence masks claim pixels first (no overlap overwrite)
         label_matrix = np.zeros((full_height, full_width), dtype=np.int32)
-        final_kept_masks = []
+        kept_bbox_crops = []
         cell_id = 1
-        for mask in kept_masks:
-            unclaimed = mask & (label_matrix == 0)
+        for idx in keep_indices:
+            by1, by2, bx1, bx2 = all_bboxes[idx]
+            crop = all_crops[idx]
+            roi = label_matrix[by1:by2, bx1:bx2]
+            unclaimed = crop & (roi == 0)
             if int(unclaimed.sum()) >= self.min_area:
-                label_matrix[unclaimed] = cell_id
-                final_kept_masks.append(unclaimed)
+                roi[unclaimed] = cell_id
+                if return_masks:
+                    kept_bbox_crops.append((by1, by2, bx1, bx2, unclaimed))
                 cell_id += 1
 
-        if len(final_kept_masks) == 0:
+        if not return_masks:
+            return label_matrix, None
+
+        if len(kept_bbox_crops) == 0:
             return label_matrix, np.empty((0, full_height, full_width), dtype=bool)
-        return label_matrix, np.array(final_kept_masks, dtype=bool)
+
+        kept_masks = np.zeros((len(kept_bbox_crops), full_height, full_width), dtype=bool)
+        for k, (by1, by2, bx1, bx2, unclaimed) in enumerate(kept_bbox_crops):
+            kept_masks[k, by1:by2, bx1:bx2] = unclaimed
+        return label_matrix, kept_masks
