@@ -96,12 +96,13 @@ def _metrics_from_matched_ious(
 
 
 def _relabel_contiguous_1d(label_map: np.ndarray) -> Tuple[np.ndarray, int]:
-    uniq, inv = np.unique(label_map, return_inverse=True)
+    uniq, inv = np.unique(label_map.ravel(), return_inverse=True)
+    inv_1d = inv.ravel()
     if len(uniq) == 0:
         return np.zeros(label_map.size, dtype=np.int32), 0
     if uniq[0] == 0:
-        return inv.astype(np.int32), len(uniq) - 1
-    return (inv + 1).astype(np.int32), len(uniq)
+        return inv_1d.astype(np.int32), len(uniq) - 1
+    return (inv_1d + 1).astype(np.int32), len(uniq)
 
 
 def compute_iou_matrix_from_labels(pred_label: np.ndarray, gt_label: np.ndarray) -> np.ndarray:
